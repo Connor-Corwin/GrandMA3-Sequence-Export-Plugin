@@ -58,10 +58,24 @@ local CFG = {
   rule  = { 0.80, 0.80, 0.80 },
   ink   = { 0.00, 0.00, 0.00 },
   muted = { 0.45, 0.45, 0.45 },
+
+  -- Set true to log every step to the command line while diagnosing a problem.
+  debug = false,
+
+  -- PopupInput is MA3's scrollable list picker and would be the nicer widget,
+  -- but on grandMA3 2.4 it returns nil without ever drawing, which silently
+  -- killed the plugin in v1.1.0. Its exact contract could not be confirmed
+  -- (the MA docs and forum are unreachable from the build environment), so it
+  -- stays off and everything runs through MessageBox, which is known to render.
+  -- Run tools/ProbeUI on the console to find the working convention, then flip
+  -- this to true.
+  useNativePicker = false,
 }
 
+local PAGE_SIZE = 8   -- radio entries per page; oversized groups fail to render
+
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.1.0"
+local PLUGIN_VERSION = "1.2.0"
 
 --=============================================================================
 -- FONT METRICS
@@ -936,6 +950,14 @@ local function complain(message)
   pcall(function() ErrEcho("%s: %s", PLUGIN_NAME, message) end)
 end
 
+--- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
+--- misbehaves only on a console is otherwise pure guesswork.
+local function trace(fmt, ...)
+  if not CFG.debug then return end
+  local args = { ... }
+  pcall(function() Printf("%s [trace]: %s", PLUGIN_NAME, string.format(fmt, table.unpack(args))) end)
+end
+
 local function showError(display, message)
   complain(message)
   pcall(function()
@@ -947,36 +969,124 @@ local function showError(display, message)
     })
   end)
 end
-
 --=============================================================================
 -- LIST PICKER
 --
--- MessageBox has no dropdown. Its `selectors` only offer type 0 (a swipe
--- button showing one value at a time) and type 1 (a radio group that draws
--- every value at once) -- handing a radio group a whole sequence pool
--- overflows the popup and renders as a black block.
+-- MessageBox has no dropdown. Its `selectors` offer exactly two widgets:
+-- type 0 is a swipe button showing one value at a time, and type 1 is a radio
+-- group that draws *every* value at once. Handing a radio group a whole
+-- sequence pool overflows the popup and renders as a black block, which is
+-- what shipped in v1.0.0.
 --
--- PopupInput is the console's own scrollable list picker:
---   PopupInput(title, uiCaller, items [, selectedValue [, x, y]]) -> string
--- It takes the display *handle* as its caller, not the display index that
--- MessageBox wants, and returns nil when dismissed.
+-- MA3 does have a scrollable list picker, PopupInput, but on 2.4 it returns
+-- nil without drawing anything, which silently aborted the plugin in v1.1.0.
+-- Its contract could not be confirmed, so it is off by default (see
+-- CFG.useNativePicker) and the picker below keeps the radio group small
+-- enough to render, adding a filter so long pools stay browsable.
+--
+-- Everything here goes through MessageBox, which returns an explicit command
+-- value, so a cancel is always a real cancel and never a silent failure.
 --=============================================================================
 
-local LIST_PAGE_SIZE = 8   -- radio entries per page in the fallback picker
+local NO_MATCHES = "(no matches)"
 
---- Fallback picker for builds without PopupInput: a paged radio group, kept
---- short enough to actually render.
-local function pickFromListPaged(display, title, entries, labels)
-  local page = 1
-  local pageCount = math.max(1, math.ceil(#entries / LIST_PAGE_SIZE))
+--- Entries whose label contains `filter`, case-insensitively.
+local function applyFilter(entries, filter)
+  if filter == nil or filter == "" then return entries end
+
+  local needle = filter:lower()
+  local matches = {}
+  for _, entry in ipairs(entries) do
+    if entry.label:lower():find(needle, 1, true) then
+      matches[#matches + 1] = entry
+    end
+  end
+  return matches
+end
+
+--- Unverified scrollable picker. Only reached when CFG.useNativePicker is on.
+local function pickWithPopupInput(caller, title, entries)
+  if _G.PopupInput == nil then return nil, false end
+
+  local labels = {}
+  for index, entry in ipairs(entries) do labels[index] = entry.label end
+
+  local ok, first, second = pcall(function()
+    return PopupInput(title, caller, labels)
+  end)
+  if not ok then return nil, false end
+
+  for _, returned in ipairs({ first, second }) do
+    if type(returned) == "number" and entries[returned] then
+      return entries[returned], true
+    end
+    if type(returned) == "string" then
+      for index, label in ipairs(labels) do
+        if label == returned then return entries[index], true end
+      end
+    end
+  end
+
+  -- Ran without producing a usable answer. Treat that as "did not work" rather
+  -- than "user cancelled" -- assuming the latter is what made v1.1.0 exit
+  -- silently on a console where PopupInput never drew at all.
+  return nil, false
+end
+
+--- Present a list and return the chosen entry, or nil when cancelled.
+--- `entries` is an array of { label = string, value = anything }.
+--- `opts` may carry { numberField = true, cancelLabel = string }. The number
+--- input's value outranks the list selection when both are given.
+--- Returns entry, typedNumber.
+local function pickFromList(caller, display, title, entries, opts)
+  opts = opts or {}
+  if #entries == 0 then return nil, nil end
+
+  if CFG.useNativePicker then
+    local chosen, worked = pickWithPopupInput(caller, title, entries)
+    if worked then return chosen, nil end
+  end
+
+  local filterable = #entries > PAGE_SIZE
+  local filter, page = "", 1
 
   while true do
-    local first = (page - 1) * LIST_PAGE_SIZE + 1
-    local last  = math.min(first + LIST_PAGE_SIZE - 1, #entries)
+    local matches   = applyFilter(entries, filter)
+    local pageCount = math.max(1, math.ceil(#matches / PAGE_SIZE))
+    if page > pageCount then page = pageCount end
 
+    local first = (page - 1) * PAGE_SIZE + 1
+    local last  = math.min(first + PAGE_SIZE - 1, #matches)
+
+    -- A radio group needs at least one value, so an empty result set still
+    -- shows a placeholder rather than an empty selector.
     local values = {}
-    for index = first, last do
-      values[labels[index]] = index
+    if #matches == 0 then
+      values[NO_MATCHES] = 0
+    else
+      for index = first, last do
+        values[matches[index].label] = index
+      end
+    end
+
+    local summary
+    if #matches == 0 then
+      summary = "No sequences match that filter."
+    elseif pageCount > 1 then
+      summary = string.format("%d matches   -   page %d of %d",
+        #matches, page, pageCount)
+    else
+      summary = string.format("%d %s", #matches, #matches == 1 and "entry" or "entries")
+    end
+
+    local inputs = {}
+    if filterable then
+      inputs[#inputs + 1] = { name = "Filter", value = filter }
+    end
+    if opts.numberField then
+      -- Deliberately always blank. A typed number outranks the list selection,
+      -- so carrying the previous one forward would hijack the next pick.
+      inputs[#inputs + 1] = { name = "Number", value = "", vkPlugin = "TextInputNumOnly" }
     end
 
     local commands = { { value = 1, name = "Select" } }
@@ -984,146 +1094,106 @@ local function pickFromListPaged(display, title, entries, labels)
       commands[#commands + 1] = { value = 2, name = "Previous" }
       commands[#commands + 1] = { value = 3, name = "Next" }
     end
-    commands[#commands + 1] = { value = 4, name = "Cancel" }
+    commands[#commands + 1] = { value = 4, name = opts.cancelLabel or "Cancel" }
 
     local result = MessageBox({
-      title   = title,
-      message = pageCount > 1
-        and string.format("Page %d of %d", page, pageCount)
-        or "",
-      display = display,
-      selectors = {
-        { name = "Item", selectedValue = first, type = 1, values = values },
-      },
-      commands = commands,
+      title     = title,
+      message   = summary,
+      display   = display,
+      inputs    = #inputs > 0 and inputs or nil,
+      selectors = { { name = "Item", selectedValue = first, type = 1, values = values } },
+      commands  = commands,
     })
 
-    if not result then return nil end
+    if not result then return nil, nil end
 
-    if result.result == 2 then
+    -- Carry the filter forward across page turns and re-selections.
+    local filterChanged = false
+    local typedFilter = result.inputs and result.inputs["Filter"]
+    if typedFilter ~= nil then
+      typedFilter = tostring(typedFilter):match("^%s*(.-)%s*$")
+      if typedFilter ~= filter then
+        filter, page, filterChanged = typedFilter, 1, true
+      end
+    end
+
+    local typedNumber
+    if opts.numberField then
+      typedNumber = result.inputs and result.inputs["Number"]
+      if typedNumber ~= nil then
+        typedNumber = tostring(typedNumber):match("^%s*(.-)%s*$")
+        if typedNumber == "" then typedNumber = nil end
+      end
+    end
+
+    if result.result ~= 1 and result.result ~= 2 and result.result ~= 3 then
+      return nil, nil
+    end
+
+    -- A typed number wins over the list, so the field is never silently
+    -- ignored -- even if the filter changed in the same round trip.
+    if result.result == 1 and typedNumber then
+      return nil, typedNumber
+    end
+
+    if filterChanged then
+      -- The selection on screen belonged to the old result set, so redraw with
+      -- the new filter instead of resolving against a list they never saw.
+      trace("filter set to %q", filter)
+    elseif result.result == 2 then
       page = page > 1 and page - 1 or pageCount
     elseif result.result == 3 then
       page = page < pageCount and page + 1 or 1
-    elseif result.result == 1 then
-      local index = tonumber(result.selectors and result.selectors["Item"])
-      if index and entries[index] then return entries[index] end
-      return nil
     else
-      return nil
+      local index = tonumber(result.selectors and result.selectors["Item"])
+      if index and matches[index] then return matches[index], nil end
+      -- Selected the placeholder, or nothing resolved: loop and let them retry.
     end
   end
 end
 
---- Present a scrollable list and return the chosen entry, or nil if dismissed.
---- `entries` is an array of { label = string, value = anything }.
-local function pickFromList(caller, display, title, entries, selectedLabel)
-  if #entries == 0 then return nil end
-
-  local labels = {}
-  for index, entry in ipairs(entries) do labels[index] = entry.label end
-
-  if _G.PopupInput ~= nil then
-    -- Some builds are reported to return the index alongside the string, so
-    -- accept either and resolve it back to an entry.
-    local ok, first, second = pcall(function()
-      return PopupInput(title, caller, labels, selectedLabel)
-    end)
-
-    if ok then
-      for _, returned in ipairs({ first, second }) do
-        if type(returned) == "number" and entries[returned] then
-          return entries[returned]
-        end
-        if type(returned) == "string" then
-          for index, label in ipairs(labels) do
-            if label == returned then return entries[index] end
-          end
-        end
-      end
-      -- PopupInput ran, so trust it: nothing matched means nothing was chosen.
-      -- Falling back here would pop a second, different picker at the user.
-      return nil
-    end
-  end
-
-  -- Only reached when PopupInput is missing or raised an error.
-  return pickFromListPaged(display, title, entries, labels)
-end
-
-local TYPE_A_NUMBER = "Enter a number..."
-
---- Ask for a sequence number in its own small dialog.
-local function askForNumber(display, previousNumber)
-  local result = MessageBox({
-    title   = PLUGIN_NAME .. " - Sequence number",
-    message = "Type the number of the sequence to export.",
-    display = display,
-    inputs  = {
-      { name = "Sequence number", value = previousNumber or "", vkPlugin = "TextInputNumOnly" },
-    },
-    commands = {
-      { value = 1, name = "Ok" },
-      { value = 2, name = "Cancel" },
-    },
-  })
-
-  if not result or result.result ~= 1 then return nil end
-
-  local typed = result.inputs and result.inputs["Sequence number"]
-  if typed == nil then return nil end
-  typed = tostring(typed):match("^%s*(.-)%s*$")
-  if typed == "" then return nil end
-  return typed
-end
-
---- Step 1: choose the data pool. Returns an entry, or nil when dismissed.
+--- Step 1: choose the data pool. Returns an entry, or nil when cancelled.
 local function askForDataPool(caller, display, pools)
-  local entries, selectedLabel = {}, nil
+  local entries = {}
   for _, pool in ipairs(pools) do
     local label = pool.no
     if pool.name ~= "" then label = label .. " - " .. pool.name end
+    if pool.active then label = label .. "   (active)" end
     entries[#entries + 1] = { label = label, value = pool }
-    if pool.active then selectedLabel = label end
   end
 
   local chosen = pickFromList(caller, display,
-    PLUGIN_NAME .. " - Select data pool", entries, selectedLabel)
+    PLUGIN_NAME .. " - Select data pool", entries)
   return chosen and chosen.value or nil
 end
 
---- Step 2: choose a sequence from a scrollable list, or type its number.
+--- Step 2: choose a sequence, by list or by typed number.
 --- Returns sequence, errorMessage. Both nil means the user backed out.
-local function askForSequence(caller, display, sequences, dataPoolHandle, previousNumber)
-  local entries = { { label = TYPE_A_NUMBER, value = TYPE_A_NUMBER } }
-  local selectedLabel
-
+--- `canGoBack` labels the dismiss button honestly: with several data pools it
+--- returns to the pool step rather than ending the run.
+local function askForSequence(caller, display, sequences, dataPoolHandle, canGoBack)
+  local entries = {}
   for _, sequence in ipairs(sequences) do
     local label = sequence.no
     if sequence.name ~= "" then label = label .. " - " .. sequence.name end
     entries[#entries + 1] = { label = label, value = sequence }
-    if previousNumber ~= nil and sequence.no == previousNumber then
-      selectedLabel = label
-    end
   end
 
-  local chosen = pickFromList(caller, display,
-    PLUGIN_NAME .. " - Select sequence", entries, selectedLabel)
-  if chosen == nil then return nil, nil end
+  local chosen, typedNumber = pickFromList(caller, display,
+    PLUGIN_NAME .. " - Select sequence", entries,
+    { numberField = true, cancelLabel = canGoBack and "Back" or "Cancel" })
 
-  if chosen.value == TYPE_A_NUMBER then
-    local typed = askForNumber(display, previousNumber)
-    if typed == nil then return nil, nil end
-
-    local match = findSequenceByNumber(sequences, typed, dataPoolHandle)
+  if typedNumber then
+    local match = findSequenceByNumber(sequences, typedNumber, dataPoolHandle)
     if not match then
-      return nil, string.format("No sequence %s exists in this data pool.", typed)
+      return nil, string.format("No sequence %s exists in this data pool.", typedNumber)
     end
     return match
   end
 
+  if chosen == nil then return nil, nil end
   return chosen.value
 end
-
 --- Step 3: confirm by name. Returns "continue", "back" or "cancel".
 local function confirmSequence(display, sequence, cueCount, pool)
   local name = sequence.name ~= "" and ('"' .. sequence.name .. '"') or "(unnamed)"
@@ -1230,16 +1300,18 @@ local function Main(displayHandle, argument)
   local display = displayIndex(displayHandle)
 
   local pools = listDataPools()
+  trace("display index %s, %d data pool(s)", tostring(display), #pools)
 
   -- With a single pool there is nothing to choose, so skip that step entirely.
   local pool = (#pools == 1) and pools[1] or nil
   if #pools == 0 then
     -- ShowData was unreadable; fall back to whichever pool is selected.
+    complain("Could not read the data pool list; using the selected pool.")
     pool = { no = "", name = "", handle = nil }
   end
 
   local step = (pool == nil) and "pool" or "sequence"
-  local sequence, sequences, cues, typedNumber
+  local sequence, sequences, cues
 
   while true do
     if step == "pool" then
@@ -1255,6 +1327,7 @@ local function Main(displayHandle, argument)
     elseif step == "sequence" then
       if sequences == nil then
         sequences = listSequences(pool.handle)
+        trace("data pool %s holds %d sequence(s)", pool.no, #sequences)
       end
 
       if #sequences == 0 then
@@ -1266,7 +1339,8 @@ local function Main(displayHandle, argument)
           return
         end
       else
-        local chosen, err = askForSequence(caller, display, sequences, pool.handle, typedNumber)
+        local chosen, err = askForSequence(
+          caller, display, sequences, pool.handle, #pools > 1)
         if err then
           showError(display, err)
         elseif chosen == nil then
@@ -1278,7 +1352,6 @@ local function Main(displayHandle, argument)
           end
         else
           sequence = chosen
-          typedNumber = chosen.no
           cues = collectCues(sequence.handle)
           if #cues == 0 then
             showError(display, string.format(

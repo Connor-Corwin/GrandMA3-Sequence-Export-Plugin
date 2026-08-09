@@ -178,12 +178,16 @@ check("drives are listed with removable first",
   #drives == 2 and drives[1].removable == true and drives[1].name == "USB_STICK")
 
 --=============================================================================
--- Full export runs
+-- Picker and full export runs
+--
+-- Throughout, PopupInput exists but always returns nil without drawing --
+-- exactly what grandMA3 2.4 does, and what silently aborted v1.1.0. Every
+-- test below therefore also proves the default path no longer depends on it.
 --=============================================================================
 
 local function reset()
   mock.answers, mock.popupAnswers = {}, {}
-  mock.dialogLog, mock.popupLog = {}, {}
+  mock.dialogLog, mock.popupLog, mock.offered = {}, {}, {}
   mock.maxSelectorEntries = 0
 end
 
@@ -195,129 +199,236 @@ local function fileContains(name, needle)
   return body:find(needle, 1, true) ~= nil
 end
 
-print("\n== export: sequence from data pool 2, picked from the scrollable list ==")
+--- Find the labels a given picker dialog offered on its Nth appearance.
+local function offeredLabels(titleFragment, occurrence)
+  local seen = 0
+  for _, dialog in ipairs(mock.offered) do
+    if dialog.title:find(titleFragment, 1, true) then
+      seen = seen + 1
+      if seen == (occurrence or 1) then return dialog.labels, dialog.message end
+    end
+  end
+  return nil
+end
+
+local function labelsInclude(labels, needle)
+  for _, label in ipairs(labels or {}) do
+    if label:find(needle, 1, true) then return true end
+  end
+  return false
+end
+
+print("\n== export: pool 2, browsing the paged list ==")
 
 reset()
-mock.popupAnswers = { "2 - Songs", "12 - Act One (Main)" }
 mock.answers = {
-  { result = 1 },                                                        -- confirm
+  { result = 1, selectors = { Item = 2 } },   -- data pool: pick "2 - Songs"
+  { result = 1, selectors = { Item = 1 } },   -- sequence: first entry on page 1
+  { result = 1 },                             -- confirm
   { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "sample" } },
-  { result = 1 },                                                        -- done
+  { result = 1 },                             -- done
 }
 Main({ index = 1 }, nil)
 
 check("sample.pdf was written", fileContains("sample.pdf", "%PDF"))
 check("it exported the pool-2 sequence", fileContains("sample.pdf", "Act One"))
-check("the PDF records which data pool it came from",
-  fileContains("sample.pdf", "Data pool 2 - Songs"))
-check("the data pool picker ran first",
-  mock.popupLog[1] and mock.popupLog[1].title:find("data pool") ~= nil,
-  mock.popupLog[1] and mock.popupLog[1].title)
-check("the active pool was preselected",
-  mock.popupLog[1] and mock.popupLog[1].selected == "1 - Default",
-  mock.popupLog[1] and tostring(mock.popupLog[1].selected))
-check("the whole sequence list went to PopupInput, not a radio group",
-  mock.popupLog[2] and #mock.popupLog[2].items == 43,
-  mock.popupLog[2] and #mock.popupLog[2].items)
-check("no MessageBox selector was handed a long list",
-  mock.maxSelectorEntries <= 2, mock.maxSelectorEntries)
-check("the number-entry option is pinned to the top of the list",
-  mock.popupLog[2] and mock.popupLog[2].items[1] == "Enter a number...",
-  mock.popupLog[2] and mock.popupLog[2].items[1])
+check("the PDF records the data pool", fileContains("sample.pdf", "Data pool 2 - Songs"))
+check("PopupInput returned nil and did not stop the export", #mock.popupLog == 0,
+  #mock.popupLog .. " PopupInput call(s)")
 
-print("\n== export: typed number, after Back from the confirm screen ==")
+local poolLabels = offeredLabels("Select data pool")
+check("the pool picker offered both pools", poolLabels and #poolLabels == 2,
+  poolLabels and #poolLabels)
+check("the active pool is marked", labelsInclude(poolLabels, "(active)"))
+
+local seqLabels, seqMessage = offeredLabels("Select sequence")
+check("the sequence picker showed one page, not the whole pool",
+  seqLabels and #seqLabels == 8, seqLabels and #seqLabels)
+check("it reported the full match count and page position",
+  seqMessage and seqMessage:find("42 matches") and seqMessage:find("page 1 of 6"),
+  tostring(seqMessage))
+check("no selector was ever handed more than one page",
+  mock.maxSelectorEntries <= 8, mock.maxSelectorEntries)
+
+print("\n== the filter narrows a 42-sequence pool ==")
 
 reset()
-mock.popupAnswers = {
-  "2 - Songs", "20 - Songs Only Encore",   -- pick the wrong one
-  "Enter a number...",                     -- Back lands on the sequence picker
-}
 mock.answers = {
-  { result = 2 },                                                    -- confirm -> Back
-  { result = 1, inputs = { ["Sequence number"] = "12" } },           -- number entry
+  { result = 1, selectors = { Item = 2 } },                          -- pool 2
+  { result = 1, inputs = { Filter = "Encore" }, selectors = { Item = 1 } },
+  { result = 1, selectors = { Item = 1 } },                          -- now pick the match
   { result = 1 },                                                    -- confirm
-  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "typed" } },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "filtered" } },
   { result = 1 },
 }
 Main({ index = 1 }, nil)
 
-check("Back re-opened the sequence picker, not the pool picker",
-  #mock.popupLog == 3 and mock.popupLog[3].title:find("sequence") ~= nil,
-  #mock.popupLog .. " popups")
-check("the typed number resolved to the right sequence",
-  fileContains("typed.pdf", "Act One"))
+local filtered, filteredMessage = offeredLabels("Select sequence", 2)
+check("the filter narrowed the list to the one match",
+  filtered and #filtered == 1 and labelsInclude(filtered, "Songs Only Encore"),
+  filtered and #filtered)
+check("the match count reflects the filter",
+  filteredMessage and filteredMessage:find("1 entry"), tostring(filteredMessage))
+check("the filtered sequence is what got exported",
+  fileContains("filtered.pdf", "Pool Two Marker"))
 
-print("\n== the data pool step is skipped when the show has only one pool ==")
+print("\n== typing a filter does not resolve against the pre-filter list ==")
+
+-- Round 2 sets the filter *and* presses Select. Item 1 of the unfiltered list
+-- is "12 - Act One (Main)"; if the picker resolved against the old list it
+-- would export that instead of redrawing.
+check("Select alongside a new filter redraws instead of selecting",
+  fileContains("filtered.pdf", "Songs Only Encore")
+    or fileContains("filtered.pdf", "Pool Two Marker"))
+check("it did not export the pre-filter selection",
+  not fileContains("filtered.pdf", "Act One (Main)"))
+
+print("\n== a filter matching nothing shows a placeholder ==")
+
+reset()
+mock.answers = {
+  { result = 1, selectors = { Item = 2 } },                             -- pool 2
+  { result = 1, inputs = { Filter = "zzzznothing" }, selectors = { Item = 1 } },
+  { result = 1, selectors = { Item = 0 } },   -- try to select the placeholder
+  { result = 1, inputs = { Filter = "" }, selectors = { Item = 1 } },   -- clear it
+  { result = 1, selectors = { Item = 1 } },                             -- pick again
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "recovered" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+local empty, emptyMessage = offeredLabels("Select sequence", 3)
+check("an empty result set still offers exactly one placeholder row",
+  empty and #empty == 1 and empty[1] == "(no matches)",
+  empty and table.concat(empty, ","))
+check("it says so in the message",
+  emptyMessage and emptyMessage:find("No sequences match"), tostring(emptyMessage))
+check("selecting the placeholder did not choose anything, and clearing recovered",
+  fileContains("recovered.pdf", "Act One"))
+
+print("\n== paging forward and wrapping ==")
+
+reset()
+mock.answers = {
+  { result = 1, selectors = { Item = 2 } },   -- pool 2
+  { result = 3, selectors = { Item = 1 } },   -- Next -> page 2
+  { result = 3, selectors = { Item = 1 } },   -- Next -> page 3
+  { result = 2, selectors = { Item = 1 } },   -- Previous -> page 2
+  { result = 1, selectors = { Item = 9 } },   -- select the first entry of page 2
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "paged" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+local _, page2 = offeredLabels("Select sequence", 2)
+local _, page3 = offeredLabels("Select sequence", 3)
+local _, backTo2 = offeredLabels("Select sequence", 4)
+check("Next advanced the page", page2 and page2:find("page 2 of 6"), tostring(page2))
+check("Next advanced again", page3 and page3:find("page 3 of 6"), tostring(page3))
+check("Previous went back", backTo2 and backTo2:find("page 2 of 6"), tostring(backTo2))
+check("paged.pdf was written", fileContains("paged.pdf", "%PDF"))
+
+print("\n== a typed number outranks the list selection ==")
+
+reset()
+mock.answers = {
+  { result = 1, selectors = { Item = 2 } },                        -- pool 2
+  -- Item 1 on screen is "12 - Act One (Main)", but 20 is typed.
+  { result = 1, selectors = { Item = 1 }, inputs = { Number = "20" } },
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "bynumber" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+check("the typed number won over the highlighted row",
+  fileContains("bynumber.pdf", "Pool Two Marker"))
+check("the list selection was ignored",
+  not fileContains("bynumber.pdf", "Act One (Main)"))
+
+print("\n== an unknown typed number reports an error ==")
+
+reset()
+mock.answers = {
+  { result = 1, selectors = { Item = 2 } },
+  { result = 1, selectors = { Item = 1 }, inputs = { Number = "999" } },
+  { result = 1 },                             -- the error box
+  { result = 4, selectors = { Item = 1 } },   -- Back to the pool picker
+  { result = 4, selectors = { Item = 1 } },   -- then cancel out of that
+}
+Main({ index = 1 }, nil)
+check("an unknown number raised an error rather than exporting",
+  mock.dialogLog[3] ~= nil and mock.dialogLog[3]:find("Error") ~= nil,
+  tostring(mock.dialogLog[3]))
+
+print("\n== Back from the confirm screen returns to the sequence list ==")
+
+reset()
+mock.answers = {
+  { result = 1, selectors = { Item = 2 } },   -- pool 2
+  { result = 1, selectors = { Item = 1 } },   -- sequence
+  { result = 2 },                             -- confirm -> Back
+  { result = 1, selectors = { Item = 2 } },   -- a different sequence
+  { result = 1 },                             -- confirm
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "afterback" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+check("Back reopened the sequence picker, not the pool picker",
+  offeredLabels("Select sequence", 2) ~= nil and offeredLabels("Select data pool", 2) == nil)
+check("the second choice is what got exported",
+  fileContains("afterback.pdf", "Pool Two Marker"))
+
+print("\n== the pool step is skipped when the show has one pool ==")
 
 mock.twoDataPools = false
 mock.install()
 mock.setUsbPath(OUT_DIR)
 reset()
-mock.popupAnswers = { "1 - Rehearsal Scratch" }
 mock.answers = {
+  { result = 1, selectors = { Item = 1 } },   -- straight to the sequence picker
   { result = 1 },
   { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "single" } },
   { result = 1 },
 }
 Main({ index = 1 }, nil)
 
-check("only one popup appeared, and it was the sequence picker",
-  #mock.popupLog == 1 and mock.popupLog[1].title:find("sequence") ~= nil,
-  #mock.popupLog .. " popup(s)")
+check("no data pool picker appeared", offeredLabels("Select data pool") == nil)
 check("single.pdf was written", fileContains("single.pdf", "%PDF"))
+
+local soleLabels = offeredLabels("Select sequence")
+check("a short list gets no filter box and no paging",
+  soleLabels and #soleLabels == 2, soleLabels and #soleLabels)
 
 mock.twoDataPools = true
 mock.install()
 mock.setUsbPath(OUT_DIR)
 
-print("\n== dismissing the picker cancels cleanly ==")
+print("\n== Cancel is the only route to 'Export cancelled' ==")
 
 reset()
-mock.popupAnswers = { "<dismiss>" }
+mock.answers = { { result = 4, selectors = { Item = 1 } } }
 Main({ index = 1 }, nil)
-check("no dialogs followed a dismissed data pool picker", #mock.dialogLog == 0,
-  #mock.dialogLog .. " dialog(s)")
+check("cancelling the first picker ends the run after exactly one dialog",
+  #mock.dialogLog == 1, #mock.dialogLog .. " dialog(s)")
 
 print("\n== a sequence with no cues is refused ==")
 
 reset()
-mock.popupAnswers = {
-  "1 - Default", "13 - Empty Sequence",
-  "<dismiss>",   -- back out of the sequence picker
-  "<dismiss>",   -- and out of the pool picker
+mock.answers = {
+  { result = 1, selectors = { Item = 1 } },   -- pool 1 (Default)
+  { result = 1, selectors = { Item = 2 } },   -- "13 - Empty Sequence"
+  { result = 1 },                             -- the "no cues" error box
+  { result = 4, selectors = { Item = 1 } },   -- Back to the pool picker
+  { result = 4, selectors = { Item = 1 } },   -- then cancel
 }
-mock.answers = { { result = 1 } }   -- the "no cues" error box
 Main({ index = 1 }, nil)
 check("an empty sequence raised an error instead of exporting",
-  mock.dialogLog[1] ~= nil and mock.dialogLog[1]:find("Error") ~= nil,
-  tostring(mock.dialogLog[1]))
-check("the error returned the user to the picker rather than exporting",
-  #mock.popupLog == 4, #mock.popupLog .. " popups")
-
-print("\n== fallback: a build without PopupInput still works ==")
-
-mock.hasPopupInput = false
-mock.install()
-mock.setUsbPath(OUT_DIR)
-reset()
-
--- Paged radio picker: pool 2, then page forward to reach sequence 12.
-mock.answers = {
-  { result = 1, selectors = { Item = 2 } },                          -- data pool 2
-  { result = 1, selectors = { Item = 2 } },                          -- sequence 12
-  { result = 1 },                                                    -- confirm
-  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "fallback" } },
-  { result = 1 },
-}
-Main({ index = 1 }, nil)
-
-check("the fallback picker completed the export", fileContains("fallback.pdf", "Act One"))
-check("no fallback page exceeded the radio-group cap",
-  mock.maxSelectorEntries <= 8, mock.maxSelectorEntries)
-
-mock.hasPopupInput = true
-mock.install()
-mock.setUsbPath(OUT_DIR)
+  mock.dialogLog[3] ~= nil and mock.dialogLog[3]:find("Error") ~= nil,
+  tostring(mock.dialogLog[3]))
 
 --=============================================================================
 

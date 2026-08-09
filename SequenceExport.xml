@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <GMA3 DataVersion="2.0.2.0">
-	<Plugin Index="1" Name="SequenceExport" Path="" Version="1.1.0.0" Author="Connor Corwin">
+	<Plugin Index="1" Name="SequenceExport" Path="" Version="1.2.0.0" Author="Connor Corwin">
 		<ComponentLua Index="1" FileName="SequenceExport.lua" />
 	</Plugin>
 </GMA3>

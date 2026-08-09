@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<GMA3 DataVersion="2.0.2.0">
+	<Plugin Index="1" Name="ProbeUI" Path="" Version="1.0.0.0" Author="Connor Corwin">
+		<ComponentLua Index="1" FileName="ProbeUI.lua" />
+	</Plugin>
+</GMA3>

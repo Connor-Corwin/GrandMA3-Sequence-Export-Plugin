@@ -38,7 +38,8 @@ the PDF bytes are generated in pure Lua, because MA3 ships no PDF library.
    | onPC, macOS | `~/MALightingTechnology/gma3_library/datapools/plugins/` |
 
    Both files must travel together — the XML is the plugin wrapper and points at
-   the Lua file by name.
+   the Lua file by name. `tools/ProbeUI.*` is an optional diagnostic, not needed
+   for normal use; install it the same way if you want to run it.
 
 2. On the console or in onPC, open the **Plugins** pool, edit an empty pool
    slot, and **Import** `SequenceExport`. Pick the drive you copied the files to
@@ -53,9 +54,11 @@ Tap the plugin. Four steps, in order:
 1. **Data pool** — a scrollable list of the show's data pools, shown as
    `2 - Songs`, with the pool you currently have active preselected. This step is
    **skipped automatically** when the show has only one data pool.
-2. **Select sequence** — a scrollable list of every sequence in the chosen pool,
-   shown as `12 - Act One`. The first entry, `Enter a number...`, opens a small
-   number input if you would rather type it.
+2. **Select sequence** — the sequences in the chosen pool, shown as
+   `12 - Act One`, eight at a time with `Previous` / `Next`. A **Filter** box
+   appears once a pool holds more than eight: type a few letters to narrow the
+   list instantly. There is also a **Number** field if you would rather type the
+   sequence number — a number you type wins over whatever row is highlighted.
 3. **Confirm** — shows the sequence number, its name, its data pool and how many
    cues will be exported. `Back` returns to the sequence list.
 4. **Destination** — the storage devices currently attached (removable drives
@@ -65,8 +68,15 @@ Tap the plugin. Four steps, in order:
 The PDF is written to the root of the chosen drive, and a final dialog shows the
 full path. The data pool it came from is recorded in the PDF's header line.
 
-Dismissing a list steps back rather than quitting outright, so you can browse
-pools and sequences freely without restarting the plugin.
+On shows with several data pools, the sequence list's dismiss button reads
+`Back` and returns you to the pool list rather than quitting, so you can browse
+freely without restarting the plugin.
+
+### If something goes wrong
+
+Set `debug = true` in the `CFG` table at the top of `SequenceExport.lua` and run
+the plugin again. It logs each step — data pools found, sequences found, filter
+changes — to the command line.
 
 ## Configuration
 
@@ -104,14 +114,20 @@ python3 verify_pdf.py out/sample.pdf
 
 `run_local.lua` asserts the text metrics, WinAnsi escaping, wrapping,
 truncation, color helpers and the MA3 data layer, then drives the full UI flow:
-exporting from a **non-active data pool**, a `Back`-navigation round trip via the
-typed-number entry, a show with a single pool (pool step skipped), a dismissed
-picker, a sequence with no cues, and — with `PopupInput` removed — the paged
-fallback picker.
+exporting from a **non-active data pool**, filtering a 42-sequence pool down to
+one match, a filter that matches nothing, paging forward and back, a typed
+number outranking the highlighted row, `Back` from the confirm screen, a show
+with a single pool (pool step skipped), an empty sequence, and cancelling.
 
-The mock deliberately makes `DataPool()` return pool 1 while the interesting
-sequences live in pool 2, so a passing export proves the pool switch actually
-happened instead of silently falling back to the active pool.
+Two invariants in there exist because both have already broken in production:
+
+- The mock makes `DataPool()` return pool 1 while the interesting sequences live
+  in pool 2, so a passing export proves the pool switch really happened rather
+  than falling back to the active pool.
+- The mock's `PopupInput` is present but always returns `nil` without drawing —
+  exactly what grandMA3 2.4 does. Every export test therefore also proves the
+  plugin no longer depends on it. A test asserts no selector is ever handed more
+  than 8 values.
 
 `verify_pdf.py` re-opens the output — which only succeeds if the hand-computed
 cross-reference byte offsets are correct — and checks pagination, page size,
@@ -134,16 +150,22 @@ cell rather than aborting the export. Two specifics worth knowing:
 - **MessageBox has no dropdown.** Its `selectors` offer exactly two widgets:
   `type = 0` is a swipe button showing one value at a time, and `type = 1` is a
   radio group that draws *every* value at once. Handing a radio group a whole
-  sequence pool overflows the popup and renders as a black block. Long lists
-  must use `PopupInput`, the console's scrollable list picker:
+  sequence pool overflows the popup and renders as a black block — this is why
+  `pickFromList()` never puts more than `PAGE_SIZE` (8) entries in a selector,
+  and why the filter exists.
+- **`PopupInput` does not work here, and is disabled.** It is MA3's scrollable
+  list picker and would be the better widget, but on grandMA3 2.4 it returns
+  `nil` without ever drawing, which made the plugin exit silently. Its exact
+  contract could not be confirmed — the documented signature wants item
+  *descriptors*, `{ {'str', name}, ... }`, rather than the plain string array
+  older examples show, and it reportedly gained a named-parameter form
+  (`PopupInput{title=, caller=, items=}`) at some point. `caller` is also a UI
+  handle, not the display index `MessageBox` takes.
 
-  ```lua
-  PopupInput(title, uiCaller, items [, selectedValue [, x, y]])  -- -> string, or nil
-  ```
-
-  Note `uiCaller` is the display **handle**, whereas `MessageBox`'s `display`
-  field wants the display **index**. `pickFromList()` wraps this and falls back
-  to a paged radio group (8 entries per page) if `PopupInput` is unavailable.
+  `CFG.useNativePicker` gates it, off by default. To find out what your build
+  actually wants, install **`tools/ProbeUI`** and run it: it tries every
+  convention against every plausible caller and prints which combination draws
+  a popup and what it returns. If one works, set `useNativePicker = true`.
 
 To confirm which Lua functions exist in your exact build, run the **`HelpLua`**
 keyword on the console — it writes `grandMA3_lua_functions.txt` into the

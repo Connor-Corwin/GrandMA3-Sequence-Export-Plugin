@@ -185,11 +185,16 @@ M.popupAnswers = {}
 M.dialogLog = {}
 --- Every item list PopupInput was handed, so tests can assert on it.
 M.popupLog = {}
+--- What each MessageBox selector offered: { title, labels, message }.
+M.offered = {}
 --- Largest number of radio entries any MessageBox selector was given.
 M.maxSelectorEntries = 0
 
 --- Set to false before install() to simulate a build without PopupInput.
 M.hasPopupInput = true
+--- Reproduces the grandMA3 2.4 behaviour that broke v1.1.0: PopupInput exists
+--- and can be called, but returns nil without ever drawing anything.
+M.popupInputAlwaysNil = true
 
 local function buildDataPool(sequences)
   local sequencePool = newHandle({}, {}, sequences)
@@ -247,11 +252,19 @@ function M.install()
 
     -- Track how many radio entries a selector was handed. Overflowing this is
     -- what rendered as a black square on the console.
+    local labels = {}
     for _, selector in ipairs(spec.selectors or {}) do
       local count = 0
-      for _ in pairs(selector.values or {}) do count = count + 1 end
+      for label in pairs(selector.values or {}) do
+        count = count + 1
+        labels[#labels + 1] = label
+      end
       if count > M.maxSelectorEntries then M.maxSelectorEntries = count end
     end
+
+    -- Record what the picker actually offered, so tests can assert on the
+    -- filtering and paging rather than just on the outcome.
+    M.offered[#M.offered + 1] = { title = spec.title, labels = labels, message = spec.message }
 
     local answer = table.remove(M.answers, 1)
     print(string.format("[dialog] %s -> %s", spec.title,
@@ -259,12 +272,29 @@ function M.install()
     if answer == nil then
       error("mock MessageBox: no scripted answer left for '" .. tostring(spec.title) .. "'")
     end
+
+    -- The real dialog echoes back whatever is sitting in its fields, so a
+    -- scripted answer that omits `inputs` must return the values it was given.
+    if answer.inputs == nil and spec.inputs ~= nil then
+      local echoed = {}
+      for _, input in ipairs(spec.inputs) do echoed[input.name] = input.value end
+      answer = {
+        result = answer.result, selectors = answer.selectors, inputs = echoed,
+      }
+    end
+
     return answer
   end
 
   if M.hasPopupInput then
     _G.PopupInput = function(title, caller, items, selectedValue)
       M.popupLog[#M.popupLog + 1] = { title = title, items = items, selected = selectedValue }
+
+      if M.popupInputAlwaysNil then
+        print(string.format("[popup]  %s -> nil (never drew, as on MA3 2.4)", title))
+        return nil
+      end
+
       local answer = table.remove(M.popupAnswers, 1)
       if answer == nil then
         error("mock PopupInput: no scripted answer left for '" .. tostring(title) .. "'")
