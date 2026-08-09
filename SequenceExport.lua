@@ -61,7 +61,7 @@ local CFG = {
 }
 
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.0.0"
+local PLUGIN_VERSION = "1.1.0"
 
 --=============================================================================
 -- FONT METRICS
@@ -508,22 +508,68 @@ local function clean(value)
   return value
 end
 
---- All sequences in the selected data pool: { {no, name, handle}, ... }
-local function listSequences()
+--- Number and name for a pool object, tolerating an unreadable No.
+local function identify(handle)
+  local no = clean(getProp(handle, "No"))
+  if no == "" then
+    local n = getNumber(handle, "No")
+    no = n and tostring(math.floor(n)) or "?"
+  end
+  return no, clean(getProp(handle, "Name"))
+end
+
+--- Every data pool in the show: { {no, name, handle, active}, ... }
+--- DataPool() only ever returns the pool that happens to be selected, so a
+--- sequence living in another pool is unreachable without walking ShowData.
+local function listDataPools()
+  local pools = {}
+
+  local ok, collection = pcall(function() return ShowData().DataPools end)
+  if not ok or collection == nil then
+    ok, collection = pcall(function() return Root().ShowData.DataPools end)
+  end
+  if not ok or collection == nil then return pools end
+
+  local activeHandle
+  local activeOk, active = pcall(function() return DataPool() end)
+  if activeOk then activeHandle = active end
+
+  for _, handle in ipairs(childrenOf(collection)) do
+    local no, name = identify(handle)
+    pools[#pools + 1] = {
+      no     = no,
+      name   = name,
+      handle = handle,
+      active = activeHandle ~= nil and handle == activeHandle,
+    }
+  end
+
+  return pools
+end
+
+--- The Sequences collection of a specific data pool, or of the active pool.
+local function sequencePoolOf(dataPoolHandle)
+  if dataPoolHandle ~= nil then
+    local ok, pool = pcall(function() return dataPoolHandle.Sequences end)
+    if ok and pool ~= nil then return pool end
+  end
+  local ok, pool = pcall(function() return DataPool().Sequences end)
+  if ok then return pool end
+  return nil
+end
+
+--- All sequences in the given data pool: { {no, name, handle}, ... }
+local function listSequences(dataPoolHandle)
   local sequences = {}
 
-  local ok, pool = pcall(function() return DataPool().Sequences end)
-  if not ok or pool == nil then return sequences end
+  local pool = sequencePoolOf(dataPoolHandle)
+  if pool == nil then return sequences end
 
   for _, handle in ipairs(childrenOf(pool)) do
-    local no = clean(getProp(handle, "No"))
-    if no == "" then
-      local n = getNumber(handle, "No")
-      no = n and tostring(math.floor(n)) or "?"
-    end
+    local no, name = identify(handle)
     sequences[#sequences + 1] = {
       no     = no,
-      name   = clean(getProp(handle, "Name")),
+      name   = name,
       handle = handle,
     }
   end
@@ -532,7 +578,7 @@ local function listSequences()
 end
 
 --- Find a sequence by its pool number, as typed by the user.
-local function findSequenceByNumber(sequences, number)
+local function findSequenceByNumber(sequences, number, dataPoolHandle)
   local wanted = tostring(number)
   for _, seq in ipairs(sequences) do
     if seq.no == wanted or tonumber(seq.no) == tonumber(wanted) then
@@ -540,8 +586,11 @@ local function findSequenceByNumber(sequences, number)
     end
   end
 
-  -- Fall back to direct pool indexing in case the pool listing missed it.
-  local ok, handle = pcall(function() return DataPool().Sequences[tonumber(number)] end)
+  -- Fall back to direct indexing, in case the listing missed it. Index the
+  -- chosen pool, not the active one.
+  local ok, handle = pcall(function()
+    return sequencePoolOf(dataPoolHandle)[tonumber(number)]
+  end)
   if ok and handle ~= nil then
     return { no = wanted, name = clean(getProp(handle, "Name")), handle = handle }
   end
@@ -681,7 +730,7 @@ local function contrastingInk(color)
 end
 
 --- Build the PDF for a sequence. Returns the PDF object.
-local function renderDocument(sequenceName, sequenceNumber, cues, showfile)
+local function renderDocument(sequenceName, sequenceNumber, cues, showfile, poolLabel)
   local pdf = PDF.new(CFG.pageWidth, CFG.pageHeight)
 
   local left        = CFG.margin
@@ -749,6 +798,7 @@ local function renderDocument(sequenceName, sequenceNumber, cues, showfile)
         meta[#meta + 1] = "Sequence " .. sequenceNumber
       end
       meta[#meta + 1] = #cues .. (#cues == 1 and " cue" or " cues")
+      if poolLabel and poolLabel ~= "" then meta[#meta + 1] = poolLabel end
       if showfile and showfile ~= "" then meta[#meta + 1] = showfile end
       local stampOk, stamp = pcall(function() return os.date("%Y-%m-%d %H:%M") end)
       if stampOk and type(stamp) == "string" then meta[#meta + 1] = stamp end
@@ -898,70 +948,197 @@ local function showError(display, message)
   end)
 end
 
---- Step 1: choose a sequence by dropdown or by typed number.
---- Returns a sequence entry, or nil when cancelled.
-local function askForSequence(display, sequences, previousNumber)
-  local values = {}
-  for index, sequence in ipairs(sequences) do
-    local label = sequence.no
-    if sequence.name ~= "" then label = label .. " - " .. sequence.name end
-    values[label] = index
+--=============================================================================
+-- LIST PICKER
+--
+-- MessageBox has no dropdown. Its `selectors` only offer type 0 (a swipe
+-- button showing one value at a time) and type 1 (a radio group that draws
+-- every value at once) -- handing a radio group a whole sequence pool
+-- overflows the popup and renders as a black block.
+--
+-- PopupInput is the console's own scrollable list picker:
+--   PopupInput(title, uiCaller, items [, selectedValue [, x, y]]) -> string
+-- It takes the display *handle* as its caller, not the display index that
+-- MessageBox wants, and returns nil when dismissed.
+--=============================================================================
+
+local LIST_PAGE_SIZE = 8   -- radio entries per page in the fallback picker
+
+--- Fallback picker for builds without PopupInput: a paged radio group, kept
+--- short enough to actually render.
+local function pickFromListPaged(display, title, entries, labels)
+  local page = 1
+  local pageCount = math.max(1, math.ceil(#entries / LIST_PAGE_SIZE))
+
+  while true do
+    local first = (page - 1) * LIST_PAGE_SIZE + 1
+    local last  = math.min(first + LIST_PAGE_SIZE - 1, #entries)
+
+    local values = {}
+    for index = first, last do
+      values[labels[index]] = index
+    end
+
+    local commands = { { value = 1, name = "Select" } }
+    if pageCount > 1 then
+      commands[#commands + 1] = { value = 2, name = "Previous" }
+      commands[#commands + 1] = { value = 3, name = "Next" }
+    end
+    commands[#commands + 1] = { value = 4, name = "Cancel" }
+
+    local result = MessageBox({
+      title   = title,
+      message = pageCount > 1
+        and string.format("Page %d of %d", page, pageCount)
+        or "",
+      display = display,
+      selectors = {
+        { name = "Item", selectedValue = first, type = 1, values = values },
+      },
+      commands = commands,
+    })
+
+    if not result then return nil end
+
+    if result.result == 2 then
+      page = page > 1 and page - 1 or pageCount
+    elseif result.result == 3 then
+      page = page < pageCount and page + 1 or 1
+    elseif result.result == 1 then
+      local index = tonumber(result.selectors and result.selectors["Item"])
+      if index and entries[index] then return entries[index] end
+      return nil
+    else
+      return nil
+    end
+  end
+end
+
+--- Present a scrollable list and return the chosen entry, or nil if dismissed.
+--- `entries` is an array of { label = string, value = anything }.
+local function pickFromList(caller, display, title, entries, selectedLabel)
+  if #entries == 0 then return nil end
+
+  local labels = {}
+  for index, entry in ipairs(entries) do labels[index] = entry.label end
+
+  if _G.PopupInput ~= nil then
+    -- Some builds are reported to return the index alongside the string, so
+    -- accept either and resolve it back to an entry.
+    local ok, first, second = pcall(function()
+      return PopupInput(title, caller, labels, selectedLabel)
+    end)
+
+    if ok then
+      for _, returned in ipairs({ first, second }) do
+        if type(returned) == "number" and entries[returned] then
+          return entries[returned]
+        end
+        if type(returned) == "string" then
+          for index, label in ipairs(labels) do
+            if label == returned then return entries[index] end
+          end
+        end
+      end
+      -- PopupInput ran, so trust it: nothing matched means nothing was chosen.
+      -- Falling back here would pop a second, different picker at the user.
+      return nil
+    end
   end
 
+  -- Only reached when PopupInput is missing or raised an error.
+  return pickFromListPaged(display, title, entries, labels)
+end
+
+local TYPE_A_NUMBER = "Enter a number..."
+
+--- Ask for a sequence number in its own small dialog.
+local function askForNumber(display, previousNumber)
   local result = MessageBox({
-    title   = PLUGIN_NAME,
-    message = "Select the sequence to export, or type its number.",
+    title   = PLUGIN_NAME .. " - Sequence number",
+    message = "Type the number of the sequence to export.",
     display = display,
-    selectors = {
-      {
-        name          = "Sequence",
-        selectedValue = 1,
-        type          = 1,   -- 1 = dropdown, which scales to long sequence lists
-        values        = values,
-      },
-    },
-    inputs = {
-      { name = "Sequence number", value = previousNumber or "" },
+    inputs  = {
+      { name = "Sequence number", value = previousNumber or "", vkPlugin = "TextInputNumOnly" },
     },
     commands = {
-      { value = 1, name = "Next" },
+      { value = 1, name = "Ok" },
       { value = 2, name = "Cancel" },
     },
   })
 
-  if not result or result.result ~= 1 then
-    return nil
+  if not result or result.result ~= 1 then return nil end
+
+  local typed = result.inputs and result.inputs["Sequence number"]
+  if typed == nil then return nil end
+  typed = tostring(typed):match("^%s*(.-)%s*$")
+  if typed == "" then return nil end
+  return typed
+end
+
+--- Step 1: choose the data pool. Returns an entry, or nil when dismissed.
+local function askForDataPool(caller, display, pools)
+  local entries, selectedLabel = {}, nil
+  for _, pool in ipairs(pools) do
+    local label = pool.no
+    if pool.name ~= "" then label = label .. " - " .. pool.name end
+    entries[#entries + 1] = { label = label, value = pool }
+    if pool.active then selectedLabel = label end
   end
 
-  -- A typed number wins over the dropdown, so the field is never ignored.
-  local typed = result.inputs and result.inputs["Sequence number"]
-  if typed ~= nil then typed = tostring(typed):match("^%s*(.-)%s*$") end
+  local chosen = pickFromList(caller, display,
+    PLUGIN_NAME .. " - Select data pool", entries, selectedLabel)
+  return chosen and chosen.value or nil
+end
 
-  if typed and typed ~= "" then
-    local match = findSequenceByNumber(sequences, typed)
+--- Step 2: choose a sequence from a scrollable list, or type its number.
+--- Returns sequence, errorMessage. Both nil means the user backed out.
+local function askForSequence(caller, display, sequences, dataPoolHandle, previousNumber)
+  local entries = { { label = TYPE_A_NUMBER, value = TYPE_A_NUMBER } }
+  local selectedLabel
+
+  for _, sequence in ipairs(sequences) do
+    local label = sequence.no
+    if sequence.name ~= "" then label = label .. " - " .. sequence.name end
+    entries[#entries + 1] = { label = label, value = sequence }
+    if previousNumber ~= nil and sequence.no == previousNumber then
+      selectedLabel = label
+    end
+  end
+
+  local chosen = pickFromList(caller, display,
+    PLUGIN_NAME .. " - Select sequence", entries, selectedLabel)
+  if chosen == nil then return nil, nil end
+
+  if chosen.value == TYPE_A_NUMBER then
+    local typed = askForNumber(display, previousNumber)
+    if typed == nil then return nil, nil end
+
+    local match = findSequenceByNumber(sequences, typed, dataPoolHandle)
     if not match then
       return nil, string.format("No sequence %s exists in this data pool.", typed)
     end
     return match
   end
 
-  local chosen = result.selectors and result.selectors["Sequence"]
-  local index = tonumber(chosen)
-  if index and sequences[index] then
-    return sequences[index]
-  end
-
-  return nil, "No sequence was selected."
+  return chosen.value
 end
 
---- Step 2: confirm by name. Returns "continue", "back" or "cancel".
-local function confirmSequence(display, sequence, cueCount)
+--- Step 3: confirm by name. Returns "continue", "back" or "cancel".
+local function confirmSequence(display, sequence, cueCount, pool)
   local name = sequence.name ~= "" and ('"' .. sequence.name .. '"') or "(unnamed)"
+
+  local where = ""
+  if pool and pool.no ~= "" then
+    where = "\nData pool " .. pool.no
+    if pool.name ~= "" then where = where .. " - " .. pool.name end
+  end
+
   local result = MessageBox({
     title   = PLUGIN_NAME .. " - Confirm",
     message = string.format(
-      "Sequence %s: %s\n\n%d %s will be exported.\n\nIs this the right sequence?",
-      sequence.no, name, cueCount, cueCount == 1 and "cue" or "cues"),
+      "Sequence %s: %s%s\n\n%d %s will be exported.\n\nIs this the right sequence?",
+      sequence.no, name, where, cueCount, cueCount == 1 and "cue" or "cues"),
     display  = display,
     commands = {
       { value = 1, name = "Continue" },
@@ -1048,41 +1225,74 @@ local function defaultFileNameFor(sequence)
 end
 
 local function Main(displayHandle, argument)
+  -- PopupInput wants the display handle itself; MessageBox wants its index.
+  local caller  = displayHandle
   local display = displayIndex(displayHandle)
 
-  local sequences = listSequences()
-  if #sequences == 0 then
-    showError(display, "No sequences found in the selected data pool.")
-    return
+  local pools = listDataPools()
+
+  -- With a single pool there is nothing to choose, so skip that step entirely.
+  local pool = (#pools == 1) and pools[1] or nil
+  if #pools == 0 then
+    -- ShowData was unreadable; fall back to whichever pool is selected.
+    pool = { no = "", name = "", handle = nil }
   end
 
-  local step = "pick"
-  local sequence, cues, typedNumber
+  local step = (pool == nil) and "pool" or "sequence"
+  local sequence, sequences, cues, typedNumber
 
   while true do
-    if step == "pick" then
-      local chosen, err = askForSequence(display, sequences, typedNumber)
-      if err then
-        showError(display, err)
-      elseif chosen == nil then
+    if step == "pool" then
+      local chosen = askForDataPool(caller, display, pools)
+      if chosen == nil then
         say("Export cancelled.")
         return
-      else
-        sequence = chosen
-        typedNumber = chosen.no
-        cues = collectCues(sequence.handle)
-        if #cues == 0 then
-          showError(display, string.format(
-            "Sequence %s has no cues to export.", sequence.no))
+      end
+      pool = chosen
+      sequences = nil
+      step = "sequence"
+
+    elseif step == "sequence" then
+      if sequences == nil then
+        sequences = listSequences(pool.handle)
+      end
+
+      if #sequences == 0 then
+        local where = pool.name ~= "" and ("data pool " .. pool.no) or "this data pool"
+        showError(display, "No sequences found in " .. where .. ".")
+        if #pools > 1 then
+          step = "pool"
         else
-          step = "confirm"
+          return
+        end
+      else
+        local chosen, err = askForSequence(caller, display, sequences, pool.handle, typedNumber)
+        if err then
+          showError(display, err)
+        elseif chosen == nil then
+          if #pools > 1 then
+            step = "pool"
+          else
+            say("Export cancelled.")
+            return
+          end
+        else
+          sequence = chosen
+          typedNumber = chosen.no
+          cues = collectCues(sequence.handle)
+          if #cues == 0 then
+            showError(display, string.format(
+              "Sequence %s has no cues to export.", sequence.no))
+          else
+            step = "confirm"
+          end
         end
       end
 
     elseif step == "confirm" then
-      local answer = confirmSequence(display, sequence, #cues)
+      local answer = confirmSequence(display, sequence, #cues, pool)
       if answer == "back" then
-        step = "pick"
+        step = "sequence"
       elseif answer == "continue" then
         step = "destination"
       else
@@ -1111,7 +1321,13 @@ local function Main(displayHandle, argument)
           local title = sequence.name ~= "" and sequence.name
             or ("Sequence " .. sequence.no)
 
-          local pdf = renderDocument(title, sequence.no, cues, showfile)
+          local poolLabel = ""
+          if pool.no ~= "" then
+            poolLabel = "Data pool " .. pool.no
+            if pool.name ~= "" then poolLabel = poolLabel .. " - " .. pool.name end
+          end
+
+          local pdf = renderDocument(title, sequence.no, cues, showfile, poolLabel)
           local written, err = pdf:writeFile(path, title)
 
           if written then
@@ -1146,7 +1362,10 @@ if _G.SEQUENCE_EXPORT_TESTING then
     tint             = tint,
     contrastingInk   = contrastingInk,
     sanitizeFileName = sanitizeFileName,
+    listDataPools    = listDataPools,
     listSequences    = listSequences,
+    findSequenceByNumber = findSequenceByNumber,
+    pickFromList     = pickFromList,
     collectCues      = collectCues,
     listDrives       = listDrives,
     renderDocument   = renderDocument,

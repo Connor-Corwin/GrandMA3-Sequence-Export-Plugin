@@ -15,7 +15,8 @@ _G.SEQUENCE_EXPORT_TESTING = true
 mock.install()
 
 local OUT_DIR = "out"
-os.execute("mkdir -p " .. OUT_DIR)
+-- Wipe previous output first, so a check can never pass on a stale artifact.
+os.execute("rm -rf " .. OUT_DIR .. " && mkdir -p " .. OUT_DIR)
 mock.setUsbPath(OUT_DIR)
 
 local Main = dofile("../SequenceExport.lua")
@@ -124,13 +125,38 @@ check("an empty name falls back", internals.sanitizeFileName("") == "Sequence")
 
 print("\n== MA3 data layer ==")
 
-local sequences = internals.listSequences()
-check("all mock sequences are listed", #sequences == 3, #sequences)
-check("sequence numbers and names are read",
-  sequences[2].no == "12" and sequences[2].name == "Act One (Main)",
-  sequences[2].no .. " / " .. sequences[2].name)
+local pools = internals.listDataPools()
+check("both data pools are listed", #pools == 2, #pools)
+check("pool numbers and names are read",
+  pools[2].no == "2" and pools[2].name == "Songs",
+  pools[2].no .. " / " .. pools[2].name)
+check("the active pool is flagged, and it is not the songs pool",
+  pools[1].active == true and pools[2].active == false)
 
-local cues = internals.collectCues(sequences[2].handle)
+-- The whole point of the data pool step: DataPool() returns pool 1, so pool 2's
+-- sequences are only reachable by walking ShowData.
+local activePoolSequences = internals.listSequences(nil)
+check("the active pool holds only its own sequences",
+  #activePoolSequences == 2, #activePoolSequences)
+
+local sequences = internals.listSequences(pools[2].handle)
+check("the songs pool is read through its own handle", #sequences == 42, #sequences)
+check("sequence numbers and names are read",
+  sequences[1].no == "12" and sequences[1].name == "Act One (Main)",
+  sequences[1].no .. " / " .. sequences[1].name)
+
+local marker
+for _, sequence in ipairs(sequences) do
+  if sequence.name == "Songs Only Encore" then marker = sequence end
+end
+check("a pool-2-only sequence is visible", marker ~= nil)
+
+check("a sequence can be found by typed number",
+  internals.findSequenceByNumber(sequences, "12", pools[2].handle).name == "Act One (Main)")
+check("an unknown number returns nil",
+  internals.findSequenceByNumber(sequences, "999", pools[2].handle) == nil)
+
+local cues = internals.collectCues(sequences[1].handle)
 check("cues are collected", #cues > 50, #cues)
 check("cue timing comes off the cue part",
   cues[3].fade == "8" and cues[3].delay == "1.5",
@@ -155,67 +181,143 @@ check("drives are listed with removable first",
 -- Full export runs
 --=============================================================================
 
-print("\n== export: multi-page sequence, chosen from the dropdown ==")
+local function reset()
+  mock.answers, mock.popupAnswers = {}, {}
+  mock.dialogLog, mock.popupLog = {}, {}
+  mock.maxSelectorEntries = 0
+end
 
+local function fileContains(name, needle)
+  local file = io.open(OUT_DIR .. "/" .. name, "rb")
+  if not file then return false end
+  local body = file:read("a")
+  file:close()
+  return body:find(needle, 1, true) ~= nil
+end
+
+print("\n== export: sequence from data pool 2, picked from the scrollable list ==")
+
+reset()
+mock.popupAnswers = { "2 - Songs", "12 - Act One (Main)" }
 mock.answers = {
-  { result = 1, selectors = { Sequence = 2 }, inputs = { ["Sequence number"] = "" } },
-  { result = 1 },
-  { result = 1, selectors = { Drive = 1 },    inputs = { ["File name"] = "sample" } },
+  { result = 1 },                                                        -- confirm
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "sample" } },
+  { result = 1 },                                                        -- done
+}
+Main({ index = 1 }, nil)
+
+check("sample.pdf was written", fileContains("sample.pdf", "%PDF"))
+check("it exported the pool-2 sequence", fileContains("sample.pdf", "Act One"))
+check("the PDF records which data pool it came from",
+  fileContains("sample.pdf", "Data pool 2 - Songs"))
+check("the data pool picker ran first",
+  mock.popupLog[1] and mock.popupLog[1].title:find("data pool") ~= nil,
+  mock.popupLog[1] and mock.popupLog[1].title)
+check("the active pool was preselected",
+  mock.popupLog[1] and mock.popupLog[1].selected == "1 - Default",
+  mock.popupLog[1] and tostring(mock.popupLog[1].selected))
+check("the whole sequence list went to PopupInput, not a radio group",
+  mock.popupLog[2] and #mock.popupLog[2].items == 43,
+  mock.popupLog[2] and #mock.popupLog[2].items)
+check("no MessageBox selector was handed a long list",
+  mock.maxSelectorEntries <= 2, mock.maxSelectorEntries)
+check("the number-entry option is pinned to the top of the list",
+  mock.popupLog[2] and mock.popupLog[2].items[1] == "Enter a number...",
+  mock.popupLog[2] and mock.popupLog[2].items[1])
+
+print("\n== export: typed number, after Back from the confirm screen ==")
+
+reset()
+mock.popupAnswers = {
+  "2 - Songs", "20 - Songs Only Encore",   -- pick the wrong one
+  "Enter a number...",                     -- Back lands on the sequence picker
+}
+mock.answers = {
+  { result = 2 },                                                    -- confirm -> Back
+  { result = 1, inputs = { ["Sequence number"] = "12" } },           -- number entry
+  { result = 1 },                                                    -- confirm
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "typed" } },
   { result = 1 },
 }
 Main({ index = 1 }, nil)
-check("sample.pdf was written",
-  (function() local f = io.open(OUT_DIR .. "/sample.pdf", "rb")
-     if f then f:close() return true end return false end)())
 
-print("\n== export: sequence chosen by typed number, after going Back ==")
+check("Back re-opened the sequence picker, not the pool picker",
+  #mock.popupLog == 3 and mock.popupLog[3].title:find("sequence") ~= nil,
+  #mock.popupLog .. " popups")
+check("the typed number resolved to the right sequence",
+  fileContains("typed.pdf", "Act One"))
 
+print("\n== the data pool step is skipped when the show has only one pool ==")
+
+mock.twoDataPools = false
+mock.install()
+mock.setUsbPath(OUT_DIR)
+reset()
+mock.popupAnswers = { "1 - Rehearsal Scratch" }
 mock.answers = {
-  -- Pick the wrong sequence, then use Back from the confirm screen.
-  { result = 1, selectors = { Sequence = 1 }, inputs = { ["Sequence number"] = "" } },
-  { result = 2 },
-  -- Second time round, type the number instead of using the dropdown.
-  { result = 1, selectors = { Sequence = 1 }, inputs = { ["Sequence number"] = "12" } },
   { result = 1 },
-  { result = 1, selectors = { Drive = 1 },    inputs = { ["File name"] = "typed" } },
-  { result = 1 },
-}
-mock.dialogLog = {}
-Main({ index = 1 }, nil)
-check("Back returned to the picker before exporting",
-  #mock.dialogLog == 6 and mock.dialogLog[3]:find("Sequence Export"),
-  #mock.dialogLog .. " dialogs")
-check("typed number selected the right sequence",
-  (function() local f = io.open(OUT_DIR .. "/typed.pdf", "rb")
-     if not f then return false end
-     local body = f:read("a") f:close()
-     return body:find("Act One", 1, true) ~= nil end)())
-
-print("\n== export: single-cue sequence ==")
-
-mock.answers = {
-  { result = 1, selectors = { Sequence = 1 }, inputs = { ["Sequence number"] = "" } },
-  { result = 1 },
-  { result = 1, selectors = { Drive = 1 },    inputs = { ["File name"] = "single" } },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "single" } },
   { result = 1 },
 }
 Main({ index = 1 }, nil)
-check("single.pdf was written",
-  (function() local f = io.open(OUT_DIR .. "/single.pdf", "rb")
-     if f then f:close() return true end return false end)())
 
-print("\n== export: sequence with no cues is refused ==")
+check("only one popup appeared, and it was the sequence picker",
+  #mock.popupLog == 1 and mock.popupLog[1].title:find("sequence") ~= nil,
+  #mock.popupLog .. " popup(s)")
+check("single.pdf was written", fileContains("single.pdf", "%PDF"))
 
-mock.answers = {
-  { result = 1, selectors = { Sequence = 3 }, inputs = { ["Sequence number"] = "" } },
-  { result = 1 },  -- the "no cues" error box
-  { result = 2 },  -- cancel out of the picker on the retry
-}
-mock.dialogLog = {}
+mock.twoDataPools = true
+mock.install()
+mock.setUsbPath(OUT_DIR)
+
+print("\n== dismissing the picker cancels cleanly ==")
+
+reset()
+mock.popupAnswers = { "<dismiss>" }
 Main({ index = 1 }, nil)
-check("empty sequence raised an error dialog instead of exporting",
-  mock.dialogLog[2] ~= nil and mock.dialogLog[2]:find("Error") ~= nil,
-  tostring(mock.dialogLog[2]))
+check("no dialogs followed a dismissed data pool picker", #mock.dialogLog == 0,
+  #mock.dialogLog .. " dialog(s)")
+
+print("\n== a sequence with no cues is refused ==")
+
+reset()
+mock.popupAnswers = {
+  "1 - Default", "13 - Empty Sequence",
+  "<dismiss>",   -- back out of the sequence picker
+  "<dismiss>",   -- and out of the pool picker
+}
+mock.answers = { { result = 1 } }   -- the "no cues" error box
+Main({ index = 1 }, nil)
+check("an empty sequence raised an error instead of exporting",
+  mock.dialogLog[1] ~= nil and mock.dialogLog[1]:find("Error") ~= nil,
+  tostring(mock.dialogLog[1]))
+check("the error returned the user to the picker rather than exporting",
+  #mock.popupLog == 4, #mock.popupLog .. " popups")
+
+print("\n== fallback: a build without PopupInput still works ==")
+
+mock.hasPopupInput = false
+mock.install()
+mock.setUsbPath(OUT_DIR)
+reset()
+
+-- Paged radio picker: pool 2, then page forward to reach sequence 12.
+mock.answers = {
+  { result = 1, selectors = { Item = 2 } },                          -- data pool 2
+  { result = 1, selectors = { Item = 2 } },                          -- sequence 12
+  { result = 1 },                                                    -- confirm
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "fallback" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+check("the fallback picker completed the export", fileContains("fallback.pdf", "Act One"))
+check("no fallback page exceeded the radio-group cap",
+  mock.maxSelectorEntries <= 8, mock.maxSelectorEntries)
+
+mock.hasPopupInput = true
+mock.install()
+mock.setUsbPath(OUT_DIR)
 
 --=============================================================================
 

@@ -133,15 +133,33 @@ local function buildLongSequence()
   return cues
 end
 
-local SEQUENCES = {
+-- Data pool 1 is the active one. The interesting sequences live in pool 2, so
+-- any test that exports them proves the pool switch really happened rather
+-- than silently falling back to DataPool().
+local POOL_1_SEQUENCES = {
   newHandle({ No = "1",  Name = "Rehearsal Scratch" }, { no = 1,  name = "Rehearsal Scratch" },
     { cueHandle("1", "Only Cue", "3", "0", "Single-cue sequence", nil) }),
 
+  newHandle({ No = "13", Name = "Empty Sequence" }, { no = 13, name = "Empty Sequence" }, {}),
+}
+
+local POOL_2_SEQUENCES = {
   newHandle({ No = "12", Name = "Act One (Main)" }, { no = 12, name = "Act One (Main)" },
     buildLongSequence()),
 
-  newHandle({ No = "13", Name = "Empty Sequence" }, { no = 13, name = "Empty Sequence" }, {}),
+  newHandle({ No = "20", Name = "Songs Only Encore" }, { no = 20, name = "Songs Only Encore" },
+    { cueHandle("1", "Pool Two Marker", "2", "0", "Exists only in data pool 2", nil) }),
 }
+
+-- Enough sequences to overflow a radio group, which is what broke on hardware.
+for i = 1, 40 do
+  POOL_2_SEQUENCES[#POOL_2_SEQUENCES + 1] = newHandle(
+    { No = tostring(100 + i), Name = "Song " .. i },
+    { no = 100 + i, name = "Song " .. i },
+    { cueHandle("1", "Go", "3", "0", "", nil) })
+end
+
+local SEQUENCES = POOL_2_SEQUENCES
 
 --=============================================================================
 -- Globals the plugin expects
@@ -162,7 +180,27 @@ end
 
 --- Scripted MessageBox answers, consumed in order.
 M.answers = {}
+--- Scripted PopupInput answers: a label string, or nil to dismiss.
+M.popupAnswers = {}
 M.dialogLog = {}
+--- Every item list PopupInput was handed, so tests can assert on it.
+M.popupLog = {}
+--- Largest number of radio entries any MessageBox selector was given.
+M.maxSelectorEntries = 0
+
+--- Set to false before install() to simulate a build without PopupInput.
+M.hasPopupInput = true
+
+local function buildDataPool(sequences)
+  local sequencePool = newHandle({}, {}, sequences)
+  for _, sequence in ipairs(sequences) do
+    local number = tonumber(rawget(sequence, "_props").No)
+    rawget(sequencePool, "_attrs")[number] = sequence
+  end
+  local pool = newHandle({}, { sequences = sequencePool })
+  rawget(pool, "_attrs").Sequences = sequencePool
+  return pool
+end
 
 function M.install()
   _G.Enums = { Roles = { Display = 2, Default = 0, Edit = 1 } }
@@ -172,19 +210,31 @@ function M.install()
   rawget(temp, "_attrs").DriveCollect = driveCollect
   local manetsocket = newHandle({}, { showfile = "Demo Show 2026" })
 
-  local root = newHandle({}, { temp = temp, manetsocket = manetsocket })
-  rawget(root, "_attrs").Temp = temp
+  local poolOne = buildDataPool(POOL_1_SEQUENCES)
+  local poolTwo = buildDataPool(POOL_2_SEQUENCES)
 
-  local sequencePool = newHandle({}, {}, SEQUENCES)
-  for _, sequence in ipairs(SEQUENCES) do
-    local number = tonumber(rawget(sequence, "_props").No)
-    rawget(sequencePool, "_attrs")[number] = sequence
-  end
-  local dataPool = newHandle({}, { sequences = sequencePool })
-  rawget(dataPool, "_attrs").Sequences = sequencePool
+  rawget(poolOne, "_props").No   = "1"
+  rawget(poolOne, "_props").Name = "Default"
+  rawget(poolTwo, "_props").No   = "2"
+  rawget(poolTwo, "_props").Name = "Songs"
+
+  local pools = { poolOne }
+  if M.twoDataPools ~= false then pools[#pools + 1] = poolTwo end
+
+  local dataPools = newHandle({}, {}, pools)
+  local showData = newHandle({}, { datapools = dataPools })
+  rawget(showData, "_attrs").DataPools = dataPools
+
+  local root = newHandle({}, {
+    temp = temp, manetsocket = manetsocket, showdata = showData,
+  })
+  rawget(root, "_attrs").Temp = temp
+  rawget(root, "_attrs").ShowData = showData
 
   _G.Root     = function() return root end
-  _G.DataPool = function() return dataPool end
+  _G.ShowData = function() return showData end
+  -- The *active* pool is pool 1, deliberately not the one holding the songs.
+  _G.DataPool = function() return poolOne end
 
   _G.Printf  = function(fmt, ...) print(string.format(fmt, ...)) end
   _G.Echo    = _G.Printf
@@ -194,6 +244,15 @@ function M.install()
 
   _G.MessageBox = function(spec)
     M.dialogLog[#M.dialogLog + 1] = spec.title
+
+    -- Track how many radio entries a selector was handed. Overflowing this is
+    -- what rendered as a black square on the console.
+    for _, selector in ipairs(spec.selectors or {}) do
+      local count = 0
+      for _ in pairs(selector.values or {}) do count = count + 1 end
+      if count > M.maxSelectorEntries then M.maxSelectorEntries = count end
+    end
+
     local answer = table.remove(M.answers, 1)
     print(string.format("[dialog] %s -> %s", spec.title,
       answer and ("result=" .. tostring(answer.result)) or "no scripted answer"))
@@ -201,6 +260,24 @@ function M.install()
       error("mock MessageBox: no scripted answer left for '" .. tostring(spec.title) .. "'")
     end
     return answer
+  end
+
+  if M.hasPopupInput then
+    _G.PopupInput = function(title, caller, items, selectedValue)
+      M.popupLog[#M.popupLog + 1] = { title = title, items = items, selected = selectedValue }
+      local answer = table.remove(M.popupAnswers, 1)
+      if answer == nil then
+        error("mock PopupInput: no scripted answer left for '" .. tostring(title) .. "'")
+      end
+      if answer == "<dismiss>" then
+        print(string.format("[popup]  %s -> dismissed", title))
+        return nil
+      end
+      print(string.format("[popup]  %s -> %s", title, tostring(answer)))
+      return answer
+    end
+  else
+    _G.PopupInput = nil
   end
 end
 
