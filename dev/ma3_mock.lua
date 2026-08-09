@@ -166,17 +166,18 @@ end
 -- any test that exports them proves the pool switch really happened rather
 -- than silently falling back to DataPool().
 local POOL_1_SEQUENCES = {
-  newHandle({ No = "1",  Name = "Rehearsal Scratch" }, { no = 1,  name = "Rehearsal Scratch" },
+  newHandle({ No = "1 (1)",  Name = "Rehearsal Scratch" }, { no = 1,  name = "Rehearsal Scratch" },
     { cueHandle("1", "Only Cue", "3", "0", "Single-cue sequence", nil) }),
 
-  newHandle({ No = "13", Name = "Empty Sequence" }, { no = 13, name = "Empty Sequence" }, {}),
+  newHandle({ No = "13 (0)", Name = "Empty Sequence" }, { no = 13, name = "Empty Sequence" }, {}),
 }
 
 local POOL_2_SEQUENCES = {
-  newHandle({ No = "12", Name = "Act One (Main)" }, { no = 12, name = "Act One (Main)" },
+  -- Sequence numbers arrive dressed up too, so the same fix has to cover them.
+  newHandle({ No = "12 (58)", Name = "Act One (Main)" }, { no = 12, name = "Act One (Main)" },
     buildLongSequence()),
 
-  newHandle({ No = "20", Name = "Songs Only Encore" }, { no = 20, name = "Songs Only Encore" },
+  newHandle({ No = "20 (1)", Name = "Songs Only Encore" }, { no = 20, name = "Songs Only Encore" },
     { cueHandle("1", "Pool Two Marker", "2", "0", "Exists only in data pool 2", nil) }),
 }
 
@@ -228,7 +229,8 @@ M.popupInputAlwaysNil = true
 local function buildDataPool(sequences)
   local sequencePool = newHandle({}, {}, sequences)
   for _, sequence in ipairs(sequences) do
-    local number = tonumber(rawget(sequence, "_props").No)
+    -- No reads "12 (58)", so index on the number inside it.
+    local number = tonumber(tostring(rawget(sequence, "_props").No):match("%d+"))
     rawget(sequencePool, "_attrs")[number] = sequence
   end
 
@@ -253,9 +255,12 @@ function M.install()
   local poolOne = buildDataPool(POOL_1_SEQUENCES)
   local poolTwo = buildDataPool(POOL_2_SEQUENCES)
 
-  rawget(poolOne, "_props").No   = "1"
+  -- The console reports a data pool's No as a rendered label, "1 (16)", not a
+  -- number. Comparing that against a typed "1" is what made the data pool
+  -- field reject every value, including its own prefill.
+  rawget(poolOne, "_props").No   = "1 (16)"
   rawget(poolOne, "_props").Name = "Default"
-  rawget(poolTwo, "_props").No   = "2"
+  rawget(poolTwo, "_props").No   = "2 (17)"
   rawget(poolTwo, "_props").Name = "Songs"
 
   local pools = { poolOne }
@@ -299,7 +304,12 @@ function M.install()
 
     -- Record what the picker actually offered, so tests can assert on the
     -- filtering and paging rather than just on the outcome.
-    M.offered[#M.offered + 1] = { title = spec.title, labels = labels, message = spec.message }
+    local fields = {}
+    for _, input in ipairs(spec.inputs or {}) do fields[input.name] = input.value end
+
+    M.offered[#M.offered + 1] = {
+      title = spec.title, labels = labels, message = spec.message, fields = fields,
+    }
 
     local answer = table.remove(M.answers, 1)
     print(string.format("[dialog] %s -> %s", spec.title,

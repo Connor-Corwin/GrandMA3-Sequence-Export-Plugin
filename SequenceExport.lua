@@ -65,10 +65,16 @@ local CFG = {
   -- MA3 keeps a CueZero and an OffCue on every sequence. They are machinery,
   -- not cues anyone wants on a printed cue sheet.
   hideSpecialCues = true,
+
+  -- Which data pool to export from. Leave nil to be asked each run, with the
+  -- field prefilled from whichever pool is active. Set a number -- dataPool = 2
+  -- -- to lock it in; the field then disappears and the dialog only asks for a
+  -- sequence. Editable from the console's plugin editor.
+  dataPool = nil,
 }
 
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.3.0"
+local PLUGIN_VERSION = "1.3.1"
 
 --- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
 --- misbehaves only on a console is otherwise pure guesswork.
@@ -525,12 +531,32 @@ local function clean(value)
   return value
 end
 
+--- Drop trailing zeros so 1.000 prints as 1 and 2.500 as 2.5.
+local function trimZeros(text)
+  if not text:find("%.") then return text end
+  return (text:gsub("0+$", ""):gsub("%.$", ""))
+end
+
+--- The first number in a display string.
+---
+--- Get(name, Roles.Display) returns a rendered label, not a value, so object
+--- numbers arrive dressed up: a data pool's No reads "1 (16)", a sequence's
+--- "12 (58)", a cue's "Cue 1 Blackout". Comparing those against a typed "1"
+--- never matches, which made the data pool field reject every value including
+--- the one it was prefilled with.
+local function numberToken(text)
+  if text == nil or text == "" then return nil end
+  local token = text:match("(%d+%.?%d*)")
+  if token == nil then return nil end
+  return trimZeros(token)
+end
+
 --- Number and name for a pool object, tolerating an unreadable No.
 local function identify(handle)
-  local no = clean(getProp(handle, "No"))
-  if no == "" then
-    local n = getNumber(handle, "No")
-    no = n and tostring(math.floor(n)) or "?"
+  local no = numberToken(clean(getProp(handle, "No")))
+  if no == nil then
+    local value = getNumber(handle, "No")
+    no = value and trimZeros(string.format("%.3f", value)) or "?"
   end
   return no, clean(getProp(handle, "Name"))
 end
@@ -718,23 +744,14 @@ local function readAppearance(cueHandle, appearanceIndex)
   return nil
 end
 
---- Drop trailing zeros so 1.000 prints as 1 and 2.500 as 2.5.
-local function trimZeros(text)
-  if not text:find("%.") then return text end
-  return (text:gsub("0+$", ""):gsub("%.$", ""))
-end
-
 --- The cue's number on its own.
 ---
 --- The display string is the cue's whole label -- "Cue 1 Blackout" -- so take
---- the first numeric token out of it rather than printing the label into a
---- column that already has the name beside it.
+--- the number out of it rather than printing the label into a column that
+--- already has the name beside it.
 local function cueNumber(cueHandle)
-  local display = getProp(cueHandle, "No")
-
-  local token = display:match("^%s*[Cc][Uu][Ee]%s*(%d+%.?%d*)")
-             or display:match("(%d+%.?%d*)")
-  if token then return trimZeros(token) end
+  local token = numberToken(getProp(cueHandle, "No"))
+  if token then return token end
 
   local value = getNumber(cueHandle, "No")
   if value then return trimZeros(string.format("%.3f", value)) end
@@ -1082,22 +1099,73 @@ end
 -- is both simpler and faster when you already know it.
 --=============================================================================
 
+--- A human list of the data pools that exist, for prompts and errors.
+local function describePools(pools)
+  local parts = {}
+  for _, pool in ipairs(pools) do
+    local label = pool.no
+    if pool.name ~= "" then label = label .. " - " .. pool.name end
+    parts[#parts + 1] = label
+  end
+  return table.concat(parts, ",  ")
+end
+
+--- Resolve a typed data pool number, forgivingly.
+local function findDataPool(pools, typed)
+  for _, candidate in ipairs(pools) do
+    if candidate.no == typed or tonumber(candidate.no) == tonumber(typed) then
+      return candidate
+    end
+  end
+
+  -- Data pools run 1..N in order, so position still finds the right one if the
+  -- No property reads oddly on some build.
+  local position = tonumber(typed)
+  if position and pools[position] then return pools[position] end
+
+  -- Last resort, mirroring the fallback findSequenceByNumber already has.
+  local ok, handle = pcall(function()
+    return ShowData().DataPools[tonumber(typed)]
+  end)
+  if ok and handle ~= nil then
+    local no, name = identify(handle)
+    return { no = no, name = name, handle = handle, active = false }
+  end
+
+  return nil
+end
+
 --- Step 1: which data pool, and which sequence.
 --- Returns pool, sequence, errorMessage. All nil means the user cancelled.
-local function askForTarget(display, pools, activePool, lastPool, lastSequence)
+local function askForTarget(display, pools, activePool, lastPool, lastSequence, lockedPool)
   local poolDefault = lastPool
     or (activePool and activePool.no)
     or (pools[1] and pools[1].no)
     or ""
 
+  local inputs = {}
+  local message
+
+  if lockedPool ~= nil then
+    -- CFG.dataPool is set, so there is nothing to ask about.
+    local label = lockedPool.no
+    if lockedPool.name ~= "" then label = label .. " - " .. lockedPool.name end
+    message = "Exporting from data pool " .. label .. "."
+  else
+    message = "Enter the data pool and the sequence to export.\n\nData pools: "
+      .. describePools(pools)
+    inputs[#inputs + 1] =
+      { name = "Data pool", value = poolDefault, vkPlugin = "TextInputNumOnly" }
+  end
+
+  inputs[#inputs + 1] =
+    { name = "Sequence", value = lastSequence or "", vkPlugin = "TextInputNumOnly" }
+
   local result = MessageBox({
-    title   = PLUGIN_NAME,
-    message = "Enter the data pool and the sequence to export.",
-    display = display,
-    inputs  = {
-      { name = "Data pool", value = poolDefault,        vkPlugin = "TextInputNumOnly" },
-      { name = "Sequence",  value = lastSequence or "", vkPlugin = "TextInputNumOnly" },
-    },
+    title    = PLUGIN_NAME,
+    message  = message,
+    display  = display,
+    inputs   = inputs,
     commands = {
       { value = 1, name = "Next" },
       { value = 2, name = "Cancel" },
@@ -1116,17 +1184,13 @@ local function askForTarget(display, pools, activePool, lastPool, lastSequence)
   local sequenceNumber = field("Sequence")
 
   -- An empty data pool field means whichever pool is currently active.
-  local pool = activePool
-  if poolNumber ~= "" then
-    pool = nil
-    for _, candidate in ipairs(pools) do
-      if candidate.no == poolNumber or tonumber(candidate.no) == tonumber(poolNumber) then
-        pool = candidate
-        break
-      end
-    end
+  local pool = lockedPool or activePool
+  if lockedPool == nil and poolNumber ~= "" then
+    pool = findDataPool(pools, poolNumber)
     if pool == nil then
-      return nil, nil, string.format("There is no data pool %s in this show.", poolNumber),
+      return nil, nil, string.format(
+        "There is no data pool %s in this show.\n\nData pools: %s",
+        poolNumber, describePools(pools)),
         poolNumber, sequenceNumber
     end
   end
@@ -1270,6 +1334,19 @@ local function Main(displayHandle, argument)
     activePool = pools[1]
   end
 
+  -- CFG.dataPool locks the export to one pool and drops the field entirely.
+  local lockedPool
+  if CFG.dataPool ~= nil then
+    lockedPool = findDataPool(pools, tostring(CFG.dataPool))
+    if lockedPool == nil then
+      showError(display, string.format(
+        "CFG.dataPool is set to %s, but there is no such data pool.\n\nData pools: %s",
+        tostring(CFG.dataPool), describePools(pools)))
+      return
+    end
+    trace("locked to data pool %s by CFG.dataPool", lockedPool.no)
+  end
+
   local step = "target"
   local pool, sequence, cues
   local lastPool, lastSequence
@@ -1277,7 +1354,7 @@ local function Main(displayHandle, argument)
   while true do
     if step == "target" then
       local chosenPool, chosenSequence, err, typedPool, typedSequence =
-        askForTarget(display, pools, activePool, lastPool, lastSequence)
+        askForTarget(display, pools, activePool, lastPool, lastSequence, lockedPool)
 
       -- Keep whatever they typed so a correction starts from it, not blank.
       lastPool, lastSequence = typedPool or lastPool, typedSequence or lastSequence
@@ -1381,6 +1458,9 @@ if _G.SEQUENCE_EXPORT_TESTING then
     findSequenceByNumber = findSequenceByNumber,
     buildAppearanceIndex = buildAppearanceIndex,
     cueNumber        = cueNumber,
+    numberToken      = numberToken,
+    findDataPool     = findDataPool,
+    describePools    = describePools,
     isSpecialCue     = isSpecialCue,
     trimZeros        = trimZeros,
     askForTarget     = askForTarget,

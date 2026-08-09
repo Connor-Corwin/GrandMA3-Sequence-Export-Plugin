@@ -51,10 +51,21 @@ the PDF bytes are generated in pure Lua, because MA3 ships no PDF library.
 
 Tap the plugin. Three steps, in order:
 
-1. **Data pool and sequence** — type both numbers. The data pool field is
-   prefilled with the pool you currently have active; leave it blank to use that
-   pool. A number that does not exist is reported rather than exported, and the
-   dialog reopens with what you typed still in it.
+1. **Data pool and sequence** — type both numbers. The dialog lists the data
+   pools that exist, and the field is prefilled with the pool you currently have
+   active; leave it blank to use that pool. A number that does not exist is
+   reported — along with the pools that do — rather than exported, and the dialog
+   reopens with what you typed still in it.
+
+   To skip this every run, set **`dataPool`** in the `CFG` table at the top of
+   `SequenceExport.lua` (editable straight from the console's plugin editor):
+
+   ```lua
+   dataPool = 2,   -- always export from data pool 2; nil asks each time
+   ```
+
+   With it set, the data pool field disappears and the dialog only asks for a
+   sequence number.
 2. **Confirm** — shows the sequence number, its name, its data pool and how many
    cues will be exported, so you can check you got the right one. `Back` returns
    to the number entry.
@@ -126,8 +137,10 @@ convenient version, because each of these has already shipped as a bug:
 
 - `DataPool()` returns pool 1 while the interesting sequences live in pool 2, so
   a passing export proves the pool switch really happened.
-- Cue `Get("No", Display)` returns whole labels like `Cue 1 Blackout`, and a test
-  asserts the Cue column renders `1`.
+- Object numbers come back as rendered labels — `1 (16)` for a data pool,
+  `12 (58)` for a sequence, `Cue 1 Blackout` for a cue — so tests cover typing
+  both `1` and `2` into the data pool field, the two values that failed on
+  hardware, as well as the Cue column rendering `1`.
 - Appearance colors resolve **only** through the pool's `Appearances` collection
   by name — `cue.appearance` is nil, exactly as on hardware — so a passing color
   test proves the fallback path, not the handle path that never worked.
@@ -149,10 +162,14 @@ cell rather than aborting the export. Two specifics worth knowing:
 - Cue timing lives on the **cue part**, not the cue. `cue.cuefade` is `nil`;
   `CueFade` is internally `CueInFade`/`CueOutFade`, so only the display role
   returns the combined string the sequence sheet shows.
-- **`Get(name, Roles.Display)` returns a display string, not a value**, and for
-  a cue that string is the whole label. `No` comes back as `Cue 1 Blackout`, not
-  `1`, so `cueNumber()` pulls the first numeric token out of it. By the same
-  token `Appearance` comes back as the appearance's *name*, never a handle.
+- **`Get(name, Roles.Display)` returns a rendered display string, not a value**,
+  and this bites everywhere object numbers are read. A data pool's `No` comes
+  back as `1 (16)`, a sequence's as `12 (58)`, a cue's as `Cue 1 Blackout`.
+  Comparing any of those against a typed `1` fails, which is why the data pool
+  field once rejected every value including its own prefill. `numberToken()`
+  pulls the first number out and everything — pools, sequences, cues — goes
+  through it. By the same mechanism `Appearance` comes back as the appearance's
+  *name*, never a handle.
 - Appearance colors come from `BackR` / `BackG` / `BackB` in the range **0–255**,
   but reading them off a handle hung on the cue does not work on every build.
   `buildAppearanceIndex()` therefore indexes the data pool's `Appearances` by

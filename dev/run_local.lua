@@ -140,9 +140,42 @@ check("an ordinary cue is not", not internals.isSpecialCue("Blackout", "2"))
 check("a cue merely mentioning zero is not",
   not internals.isSpecialCue("Zero Hour", "14"))
 
+print("\n== object numbers arrive as display labels ==")
+
+-- Get(name, Roles.Display) renders a label rather than returning a value, so
+-- object numbers come dressed up. Comparing those against a typed number is
+-- what made the data pool field reject every value, its own prefill included.
+check("a data pool label yields its number",
+  internals.numberToken("1 (16)") == "1", internals.numberToken("1 (16)"))
+check("a sequence label yields its number",
+  internals.numberToken("12 (58)") == "12", internals.numberToken("12 (58)"))
+check("a cue label yields its number",
+  internals.numberToken("Cue 1 Blackout") == "1", internals.numberToken("Cue 1 Blackout"))
+check("a decimal cue label survives",
+  internals.numberToken("Cue 2.5 Intro") == "2.5", internals.numberToken("Cue 2.5 Intro"))
+check("a bare number is unchanged", internals.numberToken("7") == "7")
+check("text with no number yields nil", internals.numberToken("OffCue") == nil)
+
 print("\n== MA3 data layer ==")
 
 local pools = internals.listDataPools()
+check("data pool numbers are bare, not the raw '1 (16)' label",
+  pools[1].no == "1" and pools[2].no == "2",
+  pools[1].no .. " / " .. pools[2].no)
+check("sequence numbers are bare too",
+  internals.listSequences(pools[2].handle)[1].no == "12",
+  internals.listSequences(pools[2].handle)[1].no)
+
+check("a data pool is found by its typed number",
+  internals.findDataPool(pools, "2").name == "Songs")
+check("data pool 1 is found too -- both failed before v1.3.1",
+  internals.findDataPool(pools, "1").name == "Default")
+check("an unknown data pool is not found",
+  internals.findDataPool(pools, "9") == nil)
+check("the pool list is described for the dialog",
+  internals.describePools(pools):find("2 - Songs", 1, true) ~= nil,
+  internals.describePools(pools))
+
 check("both data pools are listed", #pools == 2, #pools)
 check("the active pool is flagged, and it is not the songs pool",
   pools[1].active == true and pools[2].active == false)
@@ -246,6 +279,84 @@ check("only three dialogs plus the done box", #mock.dialogLog == 4,
   #mock.dialogLog .. " dialogs")
 check("no list selector was drawn at all", mock.maxSelectorEntries <= 2,
   mock.maxSelectorEntries)
+
+print("\n== the data pool field is usable at all ==")
+
+-- The exact failure reported from the console: the field was prefilled with the
+-- raw label "1 (16)", and then every value was rejected -- typing 2 said there
+-- was no data pool 2, and typing 1 said the same about 1.
+reset()
+mock.answers = {
+  { result = 1, inputs = { ["Data pool"] = "2", ["Sequence"] = "12" } },
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "pooltwo" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+check("the field is prefilled with a bare number, not '1 (16)'",
+  mock.offered[1].fields["Data pool"] == "1",
+  tostring(mock.offered[1].fields["Data pool"]))
+check("the dialog lists the pools that exist",
+  mock.offered[1].message:find("2 - Songs", 1, true) ~= nil,
+  mock.offered[1].message)
+check("typing 2 selects the songs pool", fileContains("pooltwo.pdf", "Act One"))
+
+reset()
+mock.answers = {
+  { result = 1, inputs = { ["Data pool"] = "1", ["Sequence"] = "1" } },
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "poolone" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+check("typing 1 selects the default pool", fileContains("poolone.pdf", "Rehearsal Scratch"))
+
+print("\n== an unknown data pool names the ones that exist ==")
+
+reset()
+mock.answers = {
+  { result = 1, inputs = { ["Data pool"] = "9", ["Sequence"] = "12" } },
+  { result = 1 },
+  { result = 2 },
+}
+Main({ index = 1 }, nil)
+check("the error dialog appeared", mock.dialogLog[2]:find("Error") ~= nil)
+check("the error lists the available pools",
+  mock.offered[2].message:find("1 - Default", 1, true) ~= nil,
+  mock.offered[2].message)
+
+print("\n== CFG.dataPool locks the pool and drops the field ==")
+
+reset()
+internals.CFG.dataPool = 2
+mock.answers = {
+  { result = 1, inputs = { ["Sequence"] = "12" } },
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "locked" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+check("no data pool field was offered",
+  mock.offered[1].fields["Data pool"] == nil,
+  tostring(mock.offered[1].fields["Data pool"]))
+check("the dialog says which pool it will use",
+  mock.offered[1].message:find("data pool 2", 1, true) ~= nil,
+  mock.offered[1].message)
+check("it exported from the locked pool", fileContains("locked.pdf", "Act One"))
+
+reset()
+internals.CFG.dataPool = 9
+mock.answers = { { result = 1 } }   -- the error box
+Main({ index = 1 }, nil)
+check("a CFG.dataPool that does not exist is reported",
+  mock.dialogLog[1] ~= nil and mock.dialogLog[1]:find("Error") ~= nil,
+  tostring(mock.dialogLog[1]))
+check("nothing was asked before the error", #mock.dialogLog == 1,
+  #mock.dialogLog .. " dialogs")
+
+internals.CFG.dataPool = nil
 
 print("\n== a blank data pool field falls back to the active pool ==")
 
