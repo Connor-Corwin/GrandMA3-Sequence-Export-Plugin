@@ -58,8 +58,40 @@ local APPEARANCES = {
   encore  = { name = "04 Encore",    r = 18,  g = 18,  b = 18  },  -- near black
 }
 
+--- How this mock console exposes an appearance's colour. Which one a real
+--- build uses is not known, so the suite runs the colour tests against all of
+--- them rather than betting on one.
+---   "numbers"  - Get("BackR") returns 0-255, the documented behaviour
+---   "display"  - only the display role reads, returning strings
+---   "percent"  - display role, rendered as percentages
+---   "combined" - one BackColor property holding all three channels
+M.appearanceMode = "numbers"
+
 local function appearanceHandle(spec)
   if spec == nil then return nil end
+
+  local mode = M.appearanceMode
+
+  if mode == "display" then
+    return newHandle(
+      { Name = spec.name, BackR = tostring(spec.r), BackG = tostring(spec.g),
+        BackB = tostring(spec.b), BackAlpha = "255" }, { name = spec.name })
+  end
+
+  if mode == "percent" then
+    local function pct(value) return string.format("%.1f%%", value / 255 * 100) end
+    return newHandle(
+      { Name = spec.name, BackR = pct(spec.r), BackG = pct(spec.g),
+        BackB = pct(spec.b), BackAlpha = "100%" }, { name = spec.name })
+  end
+
+  if mode == "combined" then
+    return newHandle(
+      { Name = spec.name,
+        BackColor = string.format("%d,%d,%d", spec.r, spec.g, spec.b) },
+      { name = spec.name })
+  end
+
   return newHandle(
     { Name = spec.name, BackR = spec.r, BackG = spec.g, BackB = spec.b, BackAlpha = 255 },
     { name = spec.name, backr = spec.r, backg = spec.g, backb = spec.b, backalpha = 255 })
@@ -84,14 +116,17 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
   local label = "Cue " .. no
   if name ~= "" then label = label .. " " .. name end
 
+  -- Name comes back through the display role as well, so it arrives as the
+  -- whole label too -- which is why the Name column read "Cue 1 Blackout"
+  -- while the Cue column beside it already said 1.
   local cue = newHandle(
     {
       No         = label,
-      Name       = name,
+      Name       = label,
       Note       = note,
       Appearance = appearanceSpec and appearanceSpec.name or "",
     },
-    { name = name, note = note },
+    { note = note },
     { part })
 
   -- The plugin reads the first cue part as cue[1]; mirror that.
@@ -99,16 +134,25 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
   return cue
 end
 
---- MA3 hangs these off every sequence; they must not reach the PDF.
+--- MA3 hangs these off every sequence; they must not reach the PDF. They do
+--- not carry a "Cue n" label the way ordinary cues do.
 local function specialCueHandles()
-  return {
-    cueHandle("0", "CueZero", "0", "0", "", nil),
-    cueHandle("", "OffCue", "0", "0", "", nil),
-  }
+  local function special(no, name)
+    local part = newHandle({ CueFade = "0", CueDelay = "0" }, {})
+    local cue = newHandle({ No = no, Name = name, Note = "" }, {}, { part })
+    rawget(cue, "_attrs")[1] = part
+    return cue
+  end
+
+  return { special("0", "CueZero"), special("OffCue", "OffCue") }
 end
 
-for _, spec in pairs(APPEARANCES) do
-  APPEARANCE_POOL[#APPEARANCE_POOL + 1] = appearanceHandle(spec)
+--- Rebuilt on every install() so a changed appearanceMode takes effect.
+local function rebuildAppearancePool()
+  APPEARANCE_POOL = {}
+  for _, spec in pairs(APPEARANCES) do
+    APPEARANCE_POOL[#APPEARANCE_POOL + 1] = appearanceHandle(spec)
+  end
 end
 
 --- Build a sequence long enough to force several page breaks.
@@ -246,6 +290,8 @@ end
 
 function M.install()
   _G.Enums = { Roles = { Display = 2, Default = 0, Edit = 1 } }
+
+  rebuildAppearancePool()
 
   local driveCollect = newHandle({}, {}, DRIVES)
   local temp = newHandle({}, { drivecollect = driveCollect })

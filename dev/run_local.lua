@@ -156,6 +156,26 @@ check("a decimal cue label survives",
 check("a bare number is unchanged", internals.numberToken("7") == "7")
 check("text with no number yields nil", internals.numberToken("OffCue") == nil)
 
+print("\n== cue names arrive as whole labels too ==")
+
+-- Name comes back through the display role as well, so it arrives as the cue's
+-- whole label. That put "Cue 1 Blackout" in the Name column while the Cue
+-- column beside it already said 1.
+check("a matching Cue prefix is stripped",
+  internals.stripCueLabel("Cue 1 Blackout", "1") == "Blackout",
+  internals.stripCueLabel("Cue 1 Blackout", "1"))
+check("a decimal cue works too",
+  internals.stripCueLabel("Cue 2.5 Intro Build", "2.5") == "Intro Build",
+  internals.stripCueLabel("Cue 2.5 Intro Build", "2.5"))
+check("a label with no name leaves an empty name",
+  internals.stripCueLabel("Cue 3", "3") == "",
+  internals.stripCueLabel("Cue 3", "3"))
+check("a name that is already clean is untouched",
+  internals.stripCueLabel("Blackout", "1") == "Blackout")
+check("a cue genuinely called 'Cue 5 Standby' keeps its name at cue 9",
+  internals.stripCueLabel("Cue 5 Standby", "9") == "Cue 5 Standby",
+  internals.stripCueLabel("Cue 5 Standby", "9"))
+
 print("\n== MA3 data layer ==")
 
 local pools = internals.listDataPools()
@@ -239,6 +259,39 @@ for _, cue in ipairs(cues) do
 end
 check("cues without an appearance still report nil", uncolored ~= nil)
 
+check("the name column holds the name alone, not the whole label",
+  cues[1].name == "House to Half" and cues[2].name == "Blackout",
+  cues[1].name .. " / " .. cues[2].name)
+check("an unnamed cue stays empty rather than showing its label",
+  cues[4].name == "", cues[4].name)
+
+-- Which way a build exposes appearance colour is not known, so cover them all
+-- rather than betting on one. Every mode must yield the same colour.
+print("\n== appearance colour, however the console exposes it ==")
+
+for _, mode in ipairs({ "numbers", "display", "percent", "combined" }) do
+  mock.appearanceMode = mode
+  mock.install()
+  mock.setUsbPath(OUT_DIR)
+
+  local modePools = internals.listDataPools()
+  local modeCues = internals.collectCues(
+    internals.listSequences(modePools[2].handle)[1].handle,
+    internals.buildAppearanceIndex(modePools[2].handle))
+
+  local color = modeCues[1].appearance
+  check(mode .. ": the colour is read and is the right one",
+    color ~= nil
+      and math.abs(color.r - 32 / 255) < 0.01
+      and math.abs(color.g - 78 / 255) < 0.01
+      and math.abs(color.b - 168 / 255) < 0.01,
+    color and string.format("%.3f,%.3f,%.3f", color.r, color.g, color.b) or "NO COLOUR")
+end
+
+mock.appearanceMode = "numbers"
+mock.install()
+mock.setUsbPath(OUT_DIR)
+
 local drives = internals.listDrives()
 check("drives are listed with removable first",
   #drives == 2 and drives[1].removable == true and drives[1].name == "USB_STICK")
@@ -274,7 +327,8 @@ Main({ index = 1 }, nil)
 
 check("the export ran from two typed numbers alone", fileContains("sample.pdf", "%PDF"))
 check("it read the non-active data pool", fileContains("sample.pdf", "Act One"))
-check("the PDF records the data pool", fileContains("sample.pdf", "Data pool 2 - Songs"))
+check("the PDF header no longer names the data pool",
+  not fileContains("sample.pdf", "Data pool"))
 check("only three dialogs plus the done box", #mock.dialogLog == 4,
   #mock.dialogLog .. " dialogs")
 check("no list selector was drawn at all", mock.maxSelectorEntries <= 2,

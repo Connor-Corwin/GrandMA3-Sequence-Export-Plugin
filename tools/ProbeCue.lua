@@ -100,21 +100,40 @@ local function Main(displayHandle)
   end
   log("data pool %s found", poolNumber)
 
-  -- Appearance pool: what colours exist, and under what names.
-  local ok, appearances = pcall(function() return pool.Appearances end)
-  if not ok or appearances == nil then
-    log("pool.Appearances is NOT readable -- colours cannot be resolved by name")
+  -- Appearance pool: where it lives, what is in it, and how colour reads.
+  local appearances
+  for _, route in ipairs({
+    { name = "pool.Appearances",        get = function() return pool.Appearances end },
+    { name = "pool.Appearance",         get = function() return pool.Appearance end },
+    { name = "DataPool().Appearances",  get = function() return DataPool().Appearances end },
+  }) do
+    local ok, value = pcall(route.get)
+    if ok and value ~= nil then
+      local list = children(value)
+      log("%s is readable and holds %d appearance(s)", route.name, #list)
+      if appearances == nil and #list > 0 then appearances = value end
+    else
+      log("%s is NOT readable", route.name)
+    end
+  end
+
+  if appearances == nil then
+    log("!! No appearance pool found -- colours cannot be resolved by name.")
   else
     local list = children(appearances)
-    log("pool.Appearances holds %d appearance(s)", #list)
     for index, appearance in ipairs(list) do
-      if index > 8 then log("  ... and %d more", #list - 8) break end
-      local name = select(2, pcall(function() return appearance:Get("Name") end))
-      local r = select(2, pcall(function() return appearance:Get("BackR") end))
-      local g = select(2, pcall(function() return appearance:Get("BackG") end))
-      local b = select(2, pcall(function() return appearance:Get("BackB") end))
-      log("  appearance %s: name=%s BackR=%s BackG=%s BackB=%s",
-        index, describe(name), describe(r), describe(g), describe(b))
+      if index > 6 then log("  ... and %d more", #list - 6) break end
+      log("appearance %d:", index)
+      readEveryWay("appearance", appearance, "Name")
+      readEveryWay("appearance", appearance, "BackR")
+      readEveryWay("appearance", appearance, "BackG")
+      readEveryWay("appearance", appearance, "BackB")
+      readEveryWay("appearance", appearance, "BackColor")
+    end
+
+    if list[1] ~= nil then
+      log("---- Dump() of the first appearance ----")
+      pcall(function() list[1]:Dump() end)
     end
   end
 

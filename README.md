@@ -74,7 +74,7 @@ Tap the plugin. Three steps, in order:
    `<Sequence Name>_<date>.pdf`. `Back` returns to the confirmation.
 
 The PDF is written to the root of the chosen drive, and a final dialog shows the
-full path. The data pool it came from is recorded in the PDF's header line.
+full path.
 
 MA3's **CueZero** and **OffCue** are filtered out — they are machinery rather
 than cues anyone wants on a printed sheet. Set `hideSpecialCues = false` in
@@ -141,6 +141,11 @@ convenient version, because each of these has already shipped as a bug:
   `12 (58)` for a sequence, `Cue 1 Blackout` for a cue — so tests cover typing
   both `1` and `2` into the data pool field, the two values that failed on
   hardware, as well as the Cue column rendering `1`.
+- A cue's `Name` arrives as that same label, so a test asserts the Name column
+  reads `Blackout` rather than repeating `Cue 1 Blackout`.
+- Appearance colour is exercised in **four** exposure modes — plain numbers,
+  display-role strings, percentages, and a combined `BackColor` — via
+  `mock.appearanceMode`, because which one a real build uses is still unknown.
 - Appearance colors resolve **only** through the pool's `Appearances` collection
   by name — `cue.appearance` is nil, exactly as on hardware — so a passing color
   test proves the fallback path, not the handle path that never worked.
@@ -170,8 +175,12 @@ cell rather than aborting the export. Two specifics worth knowing:
   pulls the first number out and everything — pools, sequences, cues — goes
   through it. By the same mechanism `Appearance` comes back as the appearance's
   *name*, never a handle.
-- Appearance colors come from `BackR` / `BackG` / `BackB` in the range **0–255**,
-  but reading them off a handle hung on the cue does not work on every build.
+- Appearance colors come from `BackR` / `BackG` / `BackB`, documented as
+  **0–255**, but neither the property route nor the value scale is consistent
+  between builds. `colorChannel()` reads a plain value, then the display role,
+  and detects a percentage; `combinedColor()` covers builds exposing one
+  `BackColor` instead of three channels. Reading them off a handle hung on the
+  cue does not work on every build either.
   `buildAppearanceIndex()` therefore indexes the data pool's `Appearances` by
   name once per export, and `readAppearance()` falls back to looking the cue's
   appearance *name* up in it. That fallback is the path that actually works on

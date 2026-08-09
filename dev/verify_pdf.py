@@ -134,6 +134,25 @@ def main(path: str) -> int:
     check("the cue column holds numbers, not cue labels", not labelled,
           labelled[0] if labelled else "")
 
+    # The Name column must not repeat the "Cue n" prefix the Cue column shows.
+    name_column = [
+        span
+        for block in first.get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        for span in line["spans"]
+        if 36 + 55 <= span["bbox"][0] < 36 + 55 + 150 and span["size"] < 12
+    ]
+    prefixed = [
+        s["text"] for s in name_column
+        if re.match(r"^\s*cue\s+\d", s["text"], re.IGNORECASE)
+    ]
+    check("the name column holds names, not cue labels", not prefixed,
+          prefixed[0] if prefixed else "")
+
+    # The data pool was dropped from the header line.
+    check("the header no longer names the data pool",
+          "data pool" not in doc[0].get_text().lower())
+
     print()
     if failures:
         print(f"{len(failures)} check(s) FAILED")

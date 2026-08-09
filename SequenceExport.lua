@@ -74,7 +74,7 @@ local CFG = {
 }
 
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.3.1"
+local PLUGIN_VERSION = "1.3.2"
 
 --- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
 --- misbehaves only on a console is otherwise pure guesswork.
@@ -641,12 +641,47 @@ local function findSequenceByNumber(sequences, number, dataPoolHandle)
   return nil
 end
 
---- Read one colour channel, trying the spellings MA3 has used for it.
+--- Read one colour channel.
+--- Returns value, scale -- where scale is the maximum the value can reach, so
+--- a percentage and an 8-bit number can be told apart.
 local function colorChannel(handle, name)
-  local candidates = { name, name:upper(), name:lower() }
-  for _, spelling in ipairs(candidates) do
+  local spellings = { name, name:upper(), name:lower() }
+
+  -- A plain value, if this build hands one over.
+  for _, spelling in ipairs(spellings) do
     local value = getNumber(handle, spelling)
-    if value ~= nil then return value end
+    if value ~= nil then return value, nil end
+  end
+
+  -- Otherwise the display role, which on some builds is the only reader that
+  -- works at all -- it is what every other property on this plugin relies on.
+  -- The rendered value may carry a unit, so read the scale off it too.
+  for _, spelling in ipairs(spellings) do
+    local display = getProp(handle, spelling)
+    if display ~= "" then
+      local token = numberToken(display)
+      if token ~= nil then
+        return tonumber(token), display:find("%%") and 100 or nil
+      end
+    end
+  end
+
+  return nil, nil
+end
+
+--- Some builds expose the colour as one property rather than three channels.
+local function combinedColor(handle)
+  for _, name in ipairs({ "BackColor", "Color", "BackRGB" }) do
+    local text = getProp(handle, name)
+    if text ~= "" then
+      local values = {}
+      for token in text:gmatch("%d+%.?%d*") do
+        values[#values + 1] = tonumber(token)
+      end
+      if #values >= 3 then
+        return values[1], values[2], values[3], text:find("%%") and 100 or nil
+      end
+    end
   end
   return nil
 end
@@ -655,10 +690,16 @@ end
 local function colorFromAppearance(appearance)
   if appearance == nil then return nil end
 
-  local r = colorChannel(appearance, "BackR")
-  local g = colorChannel(appearance, "BackG")
-  local b = colorChannel(appearance, "BackB")
-  if r == nil and g == nil and b == nil then return nil end
+  local r, rScale = colorChannel(appearance, "BackR")
+  local g, gScale = colorChannel(appearance, "BackG")
+  local b, bScale = colorChannel(appearance, "BackB")
+
+  local reportedScale = rScale or gScale or bScale
+
+  if r == nil and g == nil and b == nil then
+    r, g, b, reportedScale = combinedColor(appearance)
+    if r == nil then return nil end
+  end
 
   r, g, b = r or 0, g or 0, b or 0
 
@@ -666,11 +707,17 @@ local function colorFromAppearance(appearance)
   local alpha = colorChannel(appearance, "BackAlpha")
   if alpha ~= nil and alpha <= 0 then return nil end
 
-  -- Documented as 0-255, but treat an all-fractional triple as already
-  -- normalised rather than rendering an almost-black band.
-  local scale = 255
-  if r <= 1 and g <= 1 and b <= 1 and (r > 0 or g > 0 or b > 0) then
-    scale = 1
+  -- Documented as 0-255, but a build that renders percentages or fractions
+  -- would otherwise come out almost black.
+  local scale = reportedScale or 255
+  if reportedScale == nil then
+    if r <= 1 and g <= 1 and b <= 1 and (r > 0 or g > 0 or b > 0) then
+      scale = 1
+    elseif r <= 100 and g <= 100 and b <= 100 and math.max(r, g, b) > 1 then
+      -- Ambiguous between 0-100 and a dark 0-255 colour. 0-255 is documented,
+      -- so keep it; CFG.debug reports the raw values if this is ever wrong.
+      scale = 255
+    end
   end
 
   local name = clean(getProp(appearance, "Name"))
@@ -726,11 +773,14 @@ local function readAppearance(cueHandle, appearanceIndex)
     function() return cueHandle:Get("Appearance") end,
   }
 
-  for _, get in ipairs(candidates) do
+  for index, get in ipairs(candidates) do
     local ok, value = pcall(get)
     if ok and value ~= nil and type(value) ~= "string" then
       local color = colorFromAppearance(value)
-      if color ~= nil then return color end
+      if color ~= nil then
+        trace("appearance read from handle (strategy %d)", index)
+        return color
+      end
     end
   end
 
@@ -738,7 +788,13 @@ local function readAppearance(cueHandle, appearanceIndex)
   local name = clean(getProp(cueHandle, "Appearance"))
   if name ~= "" and appearanceIndex then
     local color = appearanceIndex[name] or appearanceIndex[name:lower()]
-    if color ~= nil then return color end
+    if color ~= nil then
+      trace("appearance %q resolved through the pool index", name)
+      return color
+    end
+    trace("appearance %q is not in the pool index", name)
+  elseif name == "" then
+    trace("cue reports no appearance at all")
   end
 
   return nil
@@ -757,6 +813,24 @@ local function cueNumber(cueHandle)
   if value then return trimZeros(string.format("%.3f", value)) end
 
   return ""
+end
+
+--- Strip a leading "Cue 12 " from a cue's name.
+---
+--- Name comes back through the display role too, so it arrives as the cue's
+--- whole label rather than just the name -- putting "Cue 12 Blackout" in a Name
+--- column that already has 12 in the Cue column beside it. Only strip when the
+--- number in the prefix is this cue's own, so a cue genuinely called
+--- "Cue 5 Standby" sitting at cue 9 keeps its name.
+local function stripCueLabel(name, number)
+  if name == "" or number == "" then return name end
+
+  local prefix = name:match("^%s*[Cc][Uu][Ee]%s+(%d+%.?%d*)")
+  if prefix == nil then return name end
+  if trimZeros(prefix) ~= number then return name end
+
+  local stripped = name:gsub("^%s*[Cc][Uu][Ee]%s+%d+%.?%d*%s*", "")
+  return (stripped:match("^%s*(.-)%s*$"))
 end
 
 --- MA3 hangs a CueZero and an OffCue off every sequence. Neither belongs on a
@@ -785,7 +859,7 @@ local function collectCues(sequenceHandle, appearanceIndex)
     end
 
     local number = cueNumber(cueHandle)
-    local name   = clean(getProp(cueHandle, "Name"))
+    local name   = stripCueLabel(clean(getProp(cueHandle, "Name")), number)
 
     if CFG.hideSpecialCues and isSpecialCue(name, number) then
       trace("skipping special cue %q (no %q)", name, number)
@@ -873,7 +947,7 @@ local function contrastingInk(color)
 end
 
 --- Build the PDF for a sequence. Returns the PDF object.
-local function renderDocument(sequenceName, sequenceNumber, cues, showfile, poolLabel)
+local function renderDocument(sequenceName, sequenceNumber, cues, showfile)
   local pdf = PDF.new(CFG.pageWidth, CFG.pageHeight)
 
   local left        = CFG.margin
@@ -941,7 +1015,6 @@ local function renderDocument(sequenceName, sequenceNumber, cues, showfile, pool
         meta[#meta + 1] = "Sequence " .. sequenceNumber
       end
       meta[#meta + 1] = #cues .. (#cues == 1 and " cue" or " cues")
-      if poolLabel and poolLabel ~= "" then meta[#meta + 1] = poolLabel end
       if showfile and showfile ~= "" then meta[#meta + 1] = showfile end
       local stampOk, stamp = pcall(function() return os.date("%Y-%m-%d %H:%M") end)
       if stampOk and type(stamp) == "string" then meta[#meta + 1] = stamp end
@@ -1412,13 +1485,7 @@ local function Main(displayHandle, argument)
           local title = sequence.name ~= "" and sequence.name
             or ("Sequence " .. sequence.no)
 
-          local poolLabel = ""
-          if pool.no ~= "" then
-            poolLabel = "Data pool " .. pool.no
-            if pool.name ~= "" then poolLabel = poolLabel .. " - " .. pool.name end
-          end
-
-          local pdf = renderDocument(title, sequence.no, cues, showfile, poolLabel)
+          local pdf = renderDocument(title, sequence.no, cues, showfile)
           local written, err = pdf:writeFile(path, title)
 
           if written then
@@ -1459,6 +1526,8 @@ if _G.SEQUENCE_EXPORT_TESTING then
     buildAppearanceIndex = buildAppearanceIndex,
     cueNumber        = cueNumber,
     numberToken      = numberToken,
+    stripCueLabel    = stripCueLabel,
+    colorFromAppearance = colorFromAppearance,
     findDataPool     = findDataPool,
     describePools    = describePools,
     isSpecialCue     = isSpecialCue,
