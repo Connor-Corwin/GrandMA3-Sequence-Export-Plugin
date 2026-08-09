@@ -1,0 +1,8 @@
+# Local test output from dev/run_local.lua
+dev/out/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
