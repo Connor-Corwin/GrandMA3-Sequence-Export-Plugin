@@ -104,6 +104,36 @@ def main(path: str) -> int:
     check("appearance colors are drawn as filled areas", len(fills) > 10,
           f"{len(fills)} fills")
 
+    # The bands must be actually coloured. Greyscale-only fills would mean the
+    # Appearance lookup silently failed, which is what shipped before v1.3.0.
+    def is_colored(fill: dict) -> bool:
+        color = fill.get("fill")
+        if not color:
+            return False
+        r, g, b = color[:3]
+        return max(r, g, b) - min(r, g, b) > 0.05
+
+    colored = [f for f in fills if is_colored(f)]
+    check("appearance colors are colored, not greyscale", len(colored) >= 2,
+          f"{len(colored)} colored of {len(fills)} fills")
+
+    # MA3's CueZero and OffCue are machinery and must not reach the page.
+    for machinery in ("CueZero", "Cue Zero", "OffCue", "Off Cue"):
+        check(f"{machinery!r} is not in the export",
+              machinery.lower() not in lowered)
+
+    # The Cue column holds bare numbers, not whole cue labels like
+    # "Cue 1 Blackout" with the name then repeating in the Name column.
+    cue_column = [
+        s for s in first.get_text("dict")["blocks"]
+        for line in s.get("lines", [])
+        for s in line["spans"]
+        if s["bbox"][0] < 36 + 55 and s["size"] < 12
+    ]
+    labelled = [s["text"] for s in cue_column if s["text"].strip().lower().startswith("cue ")]
+    check("the cue column holds numbers, not cue labels", not labelled,
+          labelled[0] if labelled else "")
+
     print()
     if failures:
         print(f"{len(failures)} check(s) FAILED")

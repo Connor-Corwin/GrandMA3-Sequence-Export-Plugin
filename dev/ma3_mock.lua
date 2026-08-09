@@ -65,16 +65,33 @@ local function appearanceHandle(spec)
     { name = spec.name, backr = spec.r, backg = spec.g, backb = spec.b, backalpha = 255 })
 end
 
+--- Every appearance in the show, as the Appearances pool holds them.
+local APPEARANCE_POOL = {}
+
 local function cueHandle(no, name, fade, delay, note, appearanceSpec)
   local part = newHandle(
     { CueFade = fade, CueDelay = delay },
     { cuefade = fade, cuedelay = delay })
 
-  local appearance = appearanceHandle(appearanceSpec)
+  -- Reproduce what the console actually does, which is what broke v1.2.0:
+  --
+  --   * Get("No", Display) returns the cue's whole label, "Cue 1 Blackout",
+  --     not the number -- so the Cue column printed the label and the name
+  --     appeared twice.
+  --   * cue.appearance is nil and Get("Appearance", Display) returns only the
+  --     appearance's *name*, so reading colour off a handle finds nothing and
+  --     every cue exported uncoloured.
+  local label = "Cue " .. no
+  if name ~= "" then label = label .. " " .. name end
 
   local cue = newHandle(
-    { No = no, Name = name, Note = note },
-    { no = no, name = name, note = note, appearance = appearance },
+    {
+      No         = label,
+      Name       = name,
+      Note       = note,
+      Appearance = appearanceSpec and appearanceSpec.name or "",
+    },
+    { name = name, note = note },
     { part })
 
   -- The plugin reads the first cue part as cue[1]; mirror that.
@@ -82,9 +99,21 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
   return cue
 end
 
+--- MA3 hangs these off every sequence; they must not reach the PDF.
+local function specialCueHandles()
+  return {
+    cueHandle("0", "CueZero", "0", "0", "", nil),
+    cueHandle("", "OffCue", "0", "0", "", nil),
+  }
+end
+
+for _, spec in pairs(APPEARANCES) do
+  APPEARANCE_POOL[#APPEARANCE_POOL + 1] = appearanceHandle(spec)
+end
+
 --- Build a sequence long enough to force several page breaks.
 local function buildLongSequence()
-  local cues = {}
+  local cues = specialCueHandles()
 
   local function add(...) cues[#cues + 1] = cueHandle(...) end
 
@@ -202,8 +231,14 @@ local function buildDataPool(sequences)
     local number = tonumber(rawget(sequence, "_props").No)
     rawget(sequencePool, "_attrs")[number] = sequence
   end
-  local pool = newHandle({}, { sequences = sequencePool })
-  rawget(pool, "_attrs").Sequences = sequencePool
+
+  -- Colours live here, keyed by name, because the cues themselves only expose
+  -- the appearance's name.
+  local appearancePool = newHandle({}, {}, APPEARANCE_POOL)
+
+  local pool = newHandle({}, { sequences = sequencePool, appearances = appearancePool })
+  rawget(pool, "_attrs").Sequences   = sequencePool
+  rawget(pool, "_attrs").Appearances = appearancePool
   return pool
 end
 

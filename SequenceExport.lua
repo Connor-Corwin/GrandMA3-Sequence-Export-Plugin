@@ -62,20 +62,23 @@ local CFG = {
   -- Set true to log every step to the command line while diagnosing a problem.
   debug = false,
 
-  -- PopupInput is MA3's scrollable list picker and would be the nicer widget,
-  -- but on grandMA3 2.4 it returns nil without ever drawing, which silently
-  -- killed the plugin in v1.1.0. Its exact contract could not be confirmed
-  -- (the MA docs and forum are unreachable from the build environment), so it
-  -- stays off and everything runs through MessageBox, which is known to render.
-  -- Run tools/ProbeUI on the console to find the working convention, then flip
-  -- this to true.
-  useNativePicker = false,
+  -- MA3 keeps a CueZero and an OffCue on every sequence. They are machinery,
+  -- not cues anyone wants on a printed cue sheet.
+  hideSpecialCues = true,
 }
 
-local PAGE_SIZE = 8   -- radio entries per page; oversized groups fail to render
-
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.2.0"
+local PLUGIN_VERSION = "1.3.0"
+
+--- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
+--- misbehaves only on a console is otherwise pure guesswork.
+local function trace(fmt, ...)
+  if not CFG.debug then return end
+  local args = { ... }
+  pcall(function()
+    Printf("%s [trace]: %s", PLUGIN_NAME, string.format(fmt, table.unpack(args)))
+  end)
+end
 
 --=============================================================================
 -- FONT METRICS
@@ -612,36 +615,144 @@ local function findSequenceByNumber(sequences, number, dataPoolHandle)
   return nil
 end
 
---- Read an Appearance handle into a normalized color, or nil.
-local function readAppearance(cueHandle)
-  local ok, appearance = pcall(function() return cueHandle.appearance end)
-  if not ok or appearance == nil then return nil end
+--- Read one colour channel, trying the spellings MA3 has used for it.
+local function colorChannel(handle, name)
+  local candidates = { name, name:upper(), name:lower() }
+  for _, spelling in ipairs(candidates) do
+    local value = getNumber(handle, spelling)
+    if value ~= nil then return value end
+  end
+  return nil
+end
 
-  local r = getNumber(appearance, "BackR")
-  local g = getNumber(appearance, "BackG")
-  local b = getNumber(appearance, "BackB")
+--- Turn an Appearance handle into a normalized colour, or nil.
+local function colorFromAppearance(appearance)
+  if appearance == nil then return nil end
+
+  local r = colorChannel(appearance, "BackR")
+  local g = colorChannel(appearance, "BackG")
+  local b = colorChannel(appearance, "BackB")
   if r == nil and g == nil and b == nil then return nil end
 
   r, g, b = r or 0, g or 0, b or 0
 
-  -- BackR/G/B are 0-255. A fully transparent appearance carries no color.
-  local alpha = getNumber(appearance, "BackAlpha")
+  -- A fully transparent appearance carries no colour.
+  local alpha = colorChannel(appearance, "BackAlpha")
   if alpha ~= nil and alpha <= 0 then return nil end
 
+  -- Documented as 0-255, but treat an all-fractional triple as already
+  -- normalised rather than rendering an almost-black band.
+  local scale = 255
+  if r <= 1 and g <= 1 and b <= 1 and (r > 0 or g > 0 or b > 0) then
+    scale = 1
+  end
+
   local name = clean(getProp(appearance, "Name"))
-  local key  = name ~= "" and name or string.format("%d,%d,%d", r, g, b)
 
   return {
-    r    = r / 255,
-    g    = g / 255,
-    b    = b / 255,
+    r    = math.min(1, r / scale),
+    g    = math.min(1, g / scale),
+    b    = math.min(1, b / scale),
     name = name,
-    key  = key,
+    key  = name ~= "" and name or string.format("%d,%d,%d", r, g, b),
   }
 end
 
+--- Name -> colour for every Appearance in a data pool.
+---
+--- Needed because reading a cue's Appearance as a *handle* does not work on
+--- every build: getProp() goes through Get(name, Roles.Display), which returns
+--- a display string. That is why cue numbers arrive as "Cue 1 Blackout" rather
+--- than 1, and by the same token an Appearance arrives as its name. Indexing
+--- the pool by name turns that string back into a colour.
+local function buildAppearanceIndex(dataPoolHandle)
+  local index = {}
+
+  local collection
+  if dataPoolHandle ~= nil then
+    local ok, pool = pcall(function() return dataPoolHandle.Appearances end)
+    if ok then collection = pool end
+  end
+  if collection == nil then
+    local ok, pool = pcall(function() return DataPool().Appearances end)
+    if ok then collection = pool end
+  end
+  if collection == nil then return index end
+
+  for _, handle in ipairs(childrenOf(collection)) do
+    local color = colorFromAppearance(handle)
+    local name  = clean(getProp(handle, "Name"))
+    if color ~= nil and name ~= "" then
+      index[name] = color
+      index[name:lower()] = color
+    end
+  end
+
+  return index
+end
+
+--- The colour for a cue, from a handle when that works and from the appearance
+--- name index when it does not.
+local function readAppearance(cueHandle, appearanceIndex)
+  local candidates = {
+    function() return cueHandle.appearance end,
+    function() return cueHandle.Appearance end,
+    function() return cueHandle:Get("Appearance") end,
+  }
+
+  for _, get in ipairs(candidates) do
+    local ok, value = pcall(get)
+    if ok and value ~= nil and type(value) ~= "string" then
+      local color = colorFromAppearance(value)
+      if color ~= nil then return color end
+    end
+  end
+
+  -- Fall back to the display string, which is the appearance's name.
+  local name = clean(getProp(cueHandle, "Appearance"))
+  if name ~= "" and appearanceIndex then
+    local color = appearanceIndex[name] or appearanceIndex[name:lower()]
+    if color ~= nil then return color end
+  end
+
+  return nil
+end
+
+--- Drop trailing zeros so 1.000 prints as 1 and 2.500 as 2.5.
+local function trimZeros(text)
+  if not text:find("%.") then return text end
+  return (text:gsub("0+$", ""):gsub("%.$", ""))
+end
+
+--- The cue's number on its own.
+---
+--- The display string is the cue's whole label -- "Cue 1 Blackout" -- so take
+--- the first numeric token out of it rather than printing the label into a
+--- column that already has the name beside it.
+local function cueNumber(cueHandle)
+  local display = getProp(cueHandle, "No")
+
+  local token = display:match("^%s*[Cc][Uu][Ee]%s*(%d+%.?%d*)")
+             or display:match("(%d+%.?%d*)")
+  if token then return trimZeros(token) end
+
+  local value = getNumber(cueHandle, "No")
+  if value then return trimZeros(string.format("%.3f", value)) end
+
+  return ""
+end
+
+--- MA3 hangs a CueZero and an OffCue off every sequence. Neither belongs on a
+--- printed cue sheet.
+local function isSpecialCue(name, number)
+  local squashed = name:lower():gsub("%s+", "")
+  if squashed == "cuezero" or squashed == "offcue" then return true end
+  if tonumber(number) == 0 then return true end
+  return false
+end
+
 --- Every cue of a sequence, in sheet order.
-local function collectCues(sequenceHandle)
+local function collectCues(sequenceHandle, appearanceIndex)
   local cues = {}
 
   for _, cueHandle in ipairs(childrenOf(sequenceHandle)) do
@@ -656,20 +767,21 @@ local function collectCues(sequenceHandle)
       part = childrenOf(cueHandle)[1]
     end
 
-    local number = clean(getProp(cueHandle, "No"))
-    if number == "" then
-      local n = getNumber(cueHandle, "No")
-      number = n and tostring(n) or ""
-    end
+    local number = cueNumber(cueHandle)
+    local name   = clean(getProp(cueHandle, "Name"))
 
-    cues[#cues + 1] = {
-      no         = number,
-      name       = clean(getProp(cueHandle, "Name")),
-      note       = clean(getProp(cueHandle, "Note")),
-      fade       = clean(getProp(part, "CueFade")),
-      delay      = clean(getProp(part, "CueDelay")),
-      appearance = readAppearance(cueHandle),
-    }
+    if CFG.hideSpecialCues and isSpecialCue(name, number) then
+      trace("skipping special cue %q (no %q)", name, number)
+    else
+      cues[#cues + 1] = {
+        no         = number,
+        name       = name,
+        note       = clean(getProp(cueHandle, "Note")),
+        fade       = clean(getProp(part, "CueFade")),
+        delay      = clean(getProp(part, "CueDelay")),
+        appearance = readAppearance(cueHandle, appearanceIndex),
+      }
+    end
   end
 
   return cues
@@ -949,15 +1061,6 @@ end
 local function complain(message)
   pcall(function() ErrEcho("%s: %s", PLUGIN_NAME, message) end)
 end
-
---- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
---- misbehaves only on a console is otherwise pure guesswork.
-local function trace(fmt, ...)
-  if not CFG.debug then return end
-  local args = { ... }
-  pcall(function() Printf("%s [trace]: %s", PLUGIN_NAME, string.format(fmt, table.unpack(args))) end)
-end
-
 local function showError(display, message)
   complain(message)
   pcall(function()
@@ -970,230 +1073,85 @@ local function showError(display, message)
   end)
 end
 --=============================================================================
--- LIST PICKER
+-- TARGET DIALOG
 --
--- MessageBox has no dropdown. Its `selectors` offer exactly two widgets:
--- type 0 is a swipe button showing one value at a time, and type 1 is a radio
--- group that draws *every* value at once. Handing a radio group a whole
--- sequence pool overflows the popup and renders as a black block, which is
--- what shipped in v1.0.0.
---
--- MA3 does have a scrollable list picker, PopupInput, but on 2.4 it returns
--- nil without drawing anything, which silently aborted the plugin in v1.1.0.
--- Its contract could not be confirmed, so it is off by default (see
--- CFG.useNativePicker) and the picker below keeps the radio group small
--- enough to render, adding a filter so long pools stay browsable.
---
--- Everything here goes through MessageBox, which returns an explicit command
--- value, so a cancel is always a real cancel and never a silent failure.
+-- Sequences are chosen by typing their number. Earlier versions offered a
+-- list, but MessageBox has no scrollable widget: type 0 is a swipe button and
+-- type 1 a radio group that draws every value at once, so a whole pool either
+-- overflowed the popup or had to be paged eight at a time. Typing the number
+-- is both simpler and faster when you already know it.
 --=============================================================================
 
-local NO_MATCHES = "(no matches)"
+--- Step 1: which data pool, and which sequence.
+--- Returns pool, sequence, errorMessage. All nil means the user cancelled.
+local function askForTarget(display, pools, activePool, lastPool, lastSequence)
+  local poolDefault = lastPool
+    or (activePool and activePool.no)
+    or (pools[1] and pools[1].no)
+    or ""
 
---- Entries whose label contains `filter`, case-insensitively.
-local function applyFilter(entries, filter)
-  if filter == nil or filter == "" then return entries end
+  local result = MessageBox({
+    title   = PLUGIN_NAME,
+    message = "Enter the data pool and the sequence to export.",
+    display = display,
+    inputs  = {
+      { name = "Data pool", value = poolDefault,        vkPlugin = "TextInputNumOnly" },
+      { name = "Sequence",  value = lastSequence or "", vkPlugin = "TextInputNumOnly" },
+    },
+    commands = {
+      { value = 1, name = "Next" },
+      { value = 2, name = "Cancel" },
+    },
+  })
 
-  local needle = filter:lower()
-  local matches = {}
-  for _, entry in ipairs(entries) do
-    if entry.label:lower():find(needle, 1, true) then
-      matches[#matches + 1] = entry
-    end
+  if not result or result.result ~= 1 then return nil, nil, nil end
+
+  local function field(name)
+    local value = result.inputs and result.inputs[name]
+    if value == nil then return "" end
+    return tostring(value):match("^%s*(.-)%s*$")
   end
-  return matches
-end
 
---- Unverified scrollable picker. Only reached when CFG.useNativePicker is on.
-local function pickWithPopupInput(caller, title, entries)
-  if _G.PopupInput == nil then return nil, false end
+  local poolNumber     = field("Data pool")
+  local sequenceNumber = field("Sequence")
 
-  local labels = {}
-  for index, entry in ipairs(entries) do labels[index] = entry.label end
-
-  local ok, first, second = pcall(function()
-    return PopupInput(title, caller, labels)
-  end)
-  if not ok then return nil, false end
-
-  for _, returned in ipairs({ first, second }) do
-    if type(returned) == "number" and entries[returned] then
-      return entries[returned], true
-    end
-    if type(returned) == "string" then
-      for index, label in ipairs(labels) do
-        if label == returned then return entries[index], true end
+  -- An empty data pool field means whichever pool is currently active.
+  local pool = activePool
+  if poolNumber ~= "" then
+    pool = nil
+    for _, candidate in ipairs(pools) do
+      if candidate.no == poolNumber or tonumber(candidate.no) == tonumber(poolNumber) then
+        pool = candidate
+        break
       end
     end
+    if pool == nil then
+      return nil, nil, string.format("There is no data pool %s in this show.", poolNumber),
+        poolNumber, sequenceNumber
+    end
   end
 
-  -- Ran without producing a usable answer. Treat that as "did not work" rather
-  -- than "user cancelled" -- assuming the latter is what made v1.1.0 exit
-  -- silently on a console where PopupInput never drew at all.
-  return nil, false
+  if pool == nil then
+    return nil, nil, "Could not determine which data pool to read.",
+      poolNumber, sequenceNumber
+  end
+
+  if sequenceNumber == "" then
+    return nil, nil, "Enter the number of the sequence to export.",
+      poolNumber, sequenceNumber
+  end
+
+  local sequences = listSequences(pool.handle)
+  local sequence  = findSequenceByNumber(sequences, sequenceNumber, pool.handle)
+  if sequence == nil then
+    local where = pool.no ~= "" and ("data pool " .. pool.no) or "this data pool"
+    return nil, nil, string.format("There is no sequence %s in %s.", sequenceNumber, where),
+      poolNumber, sequenceNumber
+  end
+
+  return pool, sequence, nil, poolNumber, sequenceNumber
 end
 
---- Present a list and return the chosen entry, or nil when cancelled.
---- `entries` is an array of { label = string, value = anything }.
---- `opts` may carry { numberField = true, cancelLabel = string }. The number
---- input's value outranks the list selection when both are given.
---- Returns entry, typedNumber.
-local function pickFromList(caller, display, title, entries, opts)
-  opts = opts or {}
-  if #entries == 0 then return nil, nil end
-
-  if CFG.useNativePicker then
-    local chosen, worked = pickWithPopupInput(caller, title, entries)
-    if worked then return chosen, nil end
-  end
-
-  local filterable = #entries > PAGE_SIZE
-  local filter, page = "", 1
-
-  while true do
-    local matches   = applyFilter(entries, filter)
-    local pageCount = math.max(1, math.ceil(#matches / PAGE_SIZE))
-    if page > pageCount then page = pageCount end
-
-    local first = (page - 1) * PAGE_SIZE + 1
-    local last  = math.min(first + PAGE_SIZE - 1, #matches)
-
-    -- A radio group needs at least one value, so an empty result set still
-    -- shows a placeholder rather than an empty selector.
-    local values = {}
-    if #matches == 0 then
-      values[NO_MATCHES] = 0
-    else
-      for index = first, last do
-        values[matches[index].label] = index
-      end
-    end
-
-    local summary
-    if #matches == 0 then
-      summary = "No sequences match that filter."
-    elseif pageCount > 1 then
-      summary = string.format("%d matches   -   page %d of %d",
-        #matches, page, pageCount)
-    else
-      summary = string.format("%d %s", #matches, #matches == 1 and "entry" or "entries")
-    end
-
-    local inputs = {}
-    if filterable then
-      inputs[#inputs + 1] = { name = "Filter", value = filter }
-    end
-    if opts.numberField then
-      -- Deliberately always blank. A typed number outranks the list selection,
-      -- so carrying the previous one forward would hijack the next pick.
-      inputs[#inputs + 1] = { name = "Number", value = "", vkPlugin = "TextInputNumOnly" }
-    end
-
-    local commands = { { value = 1, name = "Select" } }
-    if pageCount > 1 then
-      commands[#commands + 1] = { value = 2, name = "Previous" }
-      commands[#commands + 1] = { value = 3, name = "Next" }
-    end
-    commands[#commands + 1] = { value = 4, name = opts.cancelLabel or "Cancel" }
-
-    local result = MessageBox({
-      title     = title,
-      message   = summary,
-      display   = display,
-      inputs    = #inputs > 0 and inputs or nil,
-      selectors = { { name = "Item", selectedValue = first, type = 1, values = values } },
-      commands  = commands,
-    })
-
-    if not result then return nil, nil end
-
-    -- Carry the filter forward across page turns and re-selections.
-    local filterChanged = false
-    local typedFilter = result.inputs and result.inputs["Filter"]
-    if typedFilter ~= nil then
-      typedFilter = tostring(typedFilter):match("^%s*(.-)%s*$")
-      if typedFilter ~= filter then
-        filter, page, filterChanged = typedFilter, 1, true
-      end
-    end
-
-    local typedNumber
-    if opts.numberField then
-      typedNumber = result.inputs and result.inputs["Number"]
-      if typedNumber ~= nil then
-        typedNumber = tostring(typedNumber):match("^%s*(.-)%s*$")
-        if typedNumber == "" then typedNumber = nil end
-      end
-    end
-
-    if result.result ~= 1 and result.result ~= 2 and result.result ~= 3 then
-      return nil, nil
-    end
-
-    -- A typed number wins over the list, so the field is never silently
-    -- ignored -- even if the filter changed in the same round trip.
-    if result.result == 1 and typedNumber then
-      return nil, typedNumber
-    end
-
-    if filterChanged then
-      -- The selection on screen belonged to the old result set, so redraw with
-      -- the new filter instead of resolving against a list they never saw.
-      trace("filter set to %q", filter)
-    elseif result.result == 2 then
-      page = page > 1 and page - 1 or pageCount
-    elseif result.result == 3 then
-      page = page < pageCount and page + 1 or 1
-    else
-      local index = tonumber(result.selectors and result.selectors["Item"])
-      if index and matches[index] then return matches[index], nil end
-      -- Selected the placeholder, or nothing resolved: loop and let them retry.
-    end
-  end
-end
-
---- Step 1: choose the data pool. Returns an entry, or nil when cancelled.
-local function askForDataPool(caller, display, pools)
-  local entries = {}
-  for _, pool in ipairs(pools) do
-    local label = pool.no
-    if pool.name ~= "" then label = label .. " - " .. pool.name end
-    if pool.active then label = label .. "   (active)" end
-    entries[#entries + 1] = { label = label, value = pool }
-  end
-
-  local chosen = pickFromList(caller, display,
-    PLUGIN_NAME .. " - Select data pool", entries)
-  return chosen and chosen.value or nil
-end
-
---- Step 2: choose a sequence, by list or by typed number.
---- Returns sequence, errorMessage. Both nil means the user backed out.
---- `canGoBack` labels the dismiss button honestly: with several data pools it
---- returns to the pool step rather than ending the run.
-local function askForSequence(caller, display, sequences, dataPoolHandle, canGoBack)
-  local entries = {}
-  for _, sequence in ipairs(sequences) do
-    local label = sequence.no
-    if sequence.name ~= "" then label = label .. " - " .. sequence.name end
-    entries[#entries + 1] = { label = label, value = sequence }
-  end
-
-  local chosen, typedNumber = pickFromList(caller, display,
-    PLUGIN_NAME .. " - Select sequence", entries,
-    { numberField = true, cancelLabel = canGoBack and "Back" or "Cancel" })
-
-  if typedNumber then
-    local match = findSequenceByNumber(sequences, typedNumber, dataPoolHandle)
-    if not match then
-      return nil, string.format("No sequence %s exists in this data pool.", typedNumber)
-    end
-    return match
-  end
-
-  if chosen == nil then return nil, nil end
-  return chosen.value
-end
 --- Step 3: confirm by name. Returns "continue", "back" or "cancel".
 local function confirmSequence(display, sequence, cueCount, pool)
   local name = sequence.name ~= "" and ('"' .. sequence.name .. '"') or "(unnamed)"
@@ -1295,77 +1253,60 @@ local function defaultFileNameFor(sequence)
 end
 
 local function Main(displayHandle, argument)
-  -- PopupInput wants the display handle itself; MessageBox wants its index.
-  local caller  = displayHandle
   local display = displayIndex(displayHandle)
 
   local pools = listDataPools()
   trace("display index %s, %d data pool(s)", tostring(display), #pools)
 
-  -- With a single pool there is nothing to choose, so skip that step entirely.
-  local pool = (#pools == 1) and pools[1] or nil
+  local activePool
+  for _, candidate in ipairs(pools) do
+    if candidate.active then activePool = candidate end
+  end
+
   if #pools == 0 then
     -- ShowData was unreadable; fall back to whichever pool is selected.
     complain("Could not read the data pool list; using the selected pool.")
-    pool = { no = "", name = "", handle = nil }
+    pools = { { no = "", name = "", handle = nil, active = true } }
+    activePool = pools[1]
   end
 
-  local step = (pool == nil) and "pool" or "sequence"
-  local sequence, sequences, cues
+  local step = "target"
+  local pool, sequence, cues
+  local lastPool, lastSequence
 
   while true do
-    if step == "pool" then
-      local chosen = askForDataPool(caller, display, pools)
-      if chosen == nil then
+    if step == "target" then
+      local chosenPool, chosenSequence, err, typedPool, typedSequence =
+        askForTarget(display, pools, activePool, lastPool, lastSequence)
+
+      -- Keep whatever they typed so a correction starts from it, not blank.
+      lastPool, lastSequence = typedPool or lastPool, typedSequence or lastSequence
+
+      if err then
+        showError(display, err)
+      elseif chosenSequence == nil then
         say("Export cancelled.")
         return
-      end
-      pool = chosen
-      sequences = nil
-      step = "sequence"
-
-    elseif step == "sequence" then
-      if sequences == nil then
-        sequences = listSequences(pool.handle)
-        trace("data pool %s holds %d sequence(s)", pool.no, #sequences)
-      end
-
-      if #sequences == 0 then
-        local where = pool.name ~= "" and ("data pool " .. pool.no) or "this data pool"
-        showError(display, "No sequences found in " .. where .. ".")
-        if #pools > 1 then
-          step = "pool"
-        else
-          return
-        end
       else
-        local chosen, err = askForSequence(
-          caller, display, sequences, pool.handle, #pools > 1)
-        if err then
-          showError(display, err)
-        elseif chosen == nil then
-          if #pools > 1 then
-            step = "pool"
-          else
-            say("Export cancelled.")
-            return
-          end
+        pool, sequence = chosenPool, chosenSequence
+        trace("reading sequence %s from data pool %s", sequence.no, pool.no)
+
+        local appearances = buildAppearanceIndex(pool.handle)
+        trace("appearance index built")
+
+        cues = collectCues(sequence.handle, appearances)
+        if #cues == 0 then
+          showError(display, string.format(
+            "Sequence %s has no cues to export.", sequence.no))
         else
-          sequence = chosen
-          cues = collectCues(sequence.handle)
-          if #cues == 0 then
-            showError(display, string.format(
-              "Sequence %s has no cues to export.", sequence.no))
-          else
-            step = "confirm"
-          end
+          step = "confirm"
         end
       end
 
     elseif step == "confirm" then
       local answer = confirmSequence(display, sequence, #cues, pool)
       if answer == "back" then
-        step = "sequence"
+        step = "target"
       elseif answer == "continue" then
         step = "destination"
       else
@@ -1438,7 +1379,11 @@ if _G.SEQUENCE_EXPORT_TESTING then
     listDataPools    = listDataPools,
     listSequences    = listSequences,
     findSequenceByNumber = findSequenceByNumber,
-    pickFromList     = pickFromList,
+    buildAppearanceIndex = buildAppearanceIndex,
+    cueNumber        = cueNumber,
+    isSpecialCue     = isSpecialCue,
+    trimZeros        = trimZeros,
+    askForTarget     = askForTarget,
     collectCues      = collectCues,
     listDrives       = listDrives,
     renderDocument   = renderDocument,

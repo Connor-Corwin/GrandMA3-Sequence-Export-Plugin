@@ -38,7 +38,7 @@ the PDF bytes are generated in pure Lua, because MA3 ships no PDF library.
    | onPC, macOS | `~/MALightingTechnology/gma3_library/datapools/plugins/` |
 
    Both files must travel together — the XML is the plugin wrapper and points at
-   the Lua file by name. `tools/ProbeUI.*` is an optional diagnostic, not needed
+   the Lua file by name. `tools/ProbeCue.*` is an optional diagnostic, not needed
    for normal use; install it the same way if you want to run it.
 
 2. On the console or in onPC, open the **Plugins** pool, edit an empty pool
@@ -49,34 +49,37 @@ the PDF bytes are generated in pure Lua, because MA3 ships no PDF library.
 
 ## Using it
 
-Tap the plugin. Four steps, in order:
+Tap the plugin. Three steps, in order:
 
-1. **Data pool** — a scrollable list of the show's data pools, shown as
-   `2 - Songs`, with the pool you currently have active preselected. This step is
-   **skipped automatically** when the show has only one data pool.
-2. **Select sequence** — the sequences in the chosen pool, shown as
-   `12 - Act One`, eight at a time with `Previous` / `Next`. A **Filter** box
-   appears once a pool holds more than eight: type a few letters to narrow the
-   list instantly. There is also a **Number** field if you would rather type the
-   sequence number — a number you type wins over whatever row is highlighted.
-3. **Confirm** — shows the sequence number, its name, its data pool and how many
-   cues will be exported. `Back` returns to the sequence list.
-4. **Destination** — the storage devices currently attached (removable drives
+1. **Data pool and sequence** — type both numbers. The data pool field is
+   prefilled with the pool you currently have active; leave it blank to use that
+   pool. A number that does not exist is reported rather than exported, and the
+   dialog reopens with what you typed still in it.
+2. **Confirm** — shows the sequence number, its name, its data pool and how many
+   cues will be exported, so you can check you got the right one. `Back` returns
+   to the number entry.
+3. **Destination** — the storage devices currently attached (removable drives
    listed first), plus an editable file name prefilled with
    `<Sequence Name>_<date>.pdf`. `Back` returns to the confirmation.
 
 The PDF is written to the root of the chosen drive, and a final dialog shows the
 full path. The data pool it came from is recorded in the PDF's header line.
 
-On shows with several data pools, the sequence list's dismiss button reads
-`Back` and returns you to the pool list rather than quitting, so you can browse
-freely without restarting the plugin.
+MA3's **CueZero** and **OffCue** are filtered out — they are machinery rather
+than cues anyone wants on a printed sheet. Set `hideSpecialCues = false` in
+`CFG` to keep them.
 
 ### If something goes wrong
 
 Set `debug = true` in the `CFG` table at the top of `SequenceExport.lua` and run
-the plugin again. It logs each step — data pools found, sequences found, filter
-changes — to the command line.
+the plugin again. It logs each step — data pools found, sequences found, cues
+skipped — to the command line.
+
+For anything involving cue data itself (wrong numbers, missing colors), install
+**`tools/ProbeCue`** and run it against the sequence. It prints every way of
+reading each cue property — `Get()`, `Get()` with the display role, and direct
+attribute access — plus the Appearance pool contents, which shows what MA3 is
+actually returning rather than what it is expected to return.
 
 ## Configuration
 
@@ -113,21 +116,23 @@ python3 verify_pdf.py out/sample.pdf
 ```
 
 `run_local.lua` asserts the text metrics, WinAnsi escaping, wrapping,
-truncation, color helpers and the MA3 data layer, then drives the full UI flow:
-exporting from a **non-active data pool**, filtering a 42-sequence pool down to
-one match, a filter that matches nothing, paging forward and back, a typed
-number outranking the highlighted row, `Back` from the confirm screen, a show
-with a single pool (pool step skipped), an empty sequence, and cancelling.
+truncation, color helpers and the MA3 data layer, then drives the full flow:
+exporting from a **non-active data pool** by typed number, a blank pool field
+falling back to the active pool, rejected input (bad pool, bad sequence, blank),
+`Back` from the confirm screen, an empty sequence, and cancelling.
 
-Two invariants in there exist because both have already broken in production:
+The mock deliberately reproduces the console's real behaviour rather than the
+convenient version, because each of these has already shipped as a bug:
 
-- The mock makes `DataPool()` return pool 1 while the interesting sequences live
-  in pool 2, so a passing export proves the pool switch really happened rather
-  than falling back to the active pool.
-- The mock's `PopupInput` is present but always returns `nil` without drawing —
-  exactly what grandMA3 2.4 does. Every export test therefore also proves the
-  plugin no longer depends on it. A test asserts no selector is ever handed more
-  than 8 values.
+- `DataPool()` returns pool 1 while the interesting sequences live in pool 2, so
+  a passing export proves the pool switch really happened.
+- Cue `Get("No", Display)` returns whole labels like `Cue 1 Blackout`, and a test
+  asserts the Cue column renders `1`.
+- Appearance colors resolve **only** through the pool's `Appearances` collection
+  by name — `cue.appearance` is nil, exactly as on hardware — so a passing color
+  test proves the fallback path, not the handle path that never worked.
+- The mock sequence carries a `CueZero` and an `OffCue`, asserted absent from the
+  PDF text.
 
 `verify_pdf.py` re-opens the output — which only succeeds if the hand-computed
 cross-reference byte offsets are correct — and checks pagination, page size,
@@ -144,28 +149,32 @@ cell rather than aborting the export. Two specifics worth knowing:
 - Cue timing lives on the **cue part**, not the cue. `cue.cuefade` is `nil`;
   `CueFade` is internally `CueInFade`/`CueOutFade`, so only the display role
   returns the combined string the sequence sheet shows.
-- Appearance colors come from `BackR` / `BackG` / `BackB` in the range **0–255**.
+- **`Get(name, Roles.Display)` returns a display string, not a value**, and for
+  a cue that string is the whole label. `No` comes back as `Cue 1 Blackout`, not
+  `1`, so `cueNumber()` pulls the first numeric token out of it. By the same
+  token `Appearance` comes back as the appearance's *name*, never a handle.
+- Appearance colors come from `BackR` / `BackG` / `BackB` in the range **0–255**,
+  but reading them off a handle hung on the cue does not work on every build.
+  `buildAppearanceIndex()` therefore indexes the data pool's `Appearances` by
+  name once per export, and `readAppearance()` falls back to looking the cue's
+  appearance *name* up in it. That fallback is the path that actually works on
+  grandMA3 2.4 — without it every cue exports uncolored.
 - `DataPool()` returns only the pool that happens to be **selected**. Reaching
   any other pool means walking `ShowData().DataPools`.
+- Every sequence has a **CueZero** and an **OffCue** among its children. They are
+  real cue objects and will land in the export unless filtered.
 - **MessageBox has no dropdown.** Its `selectors` offer exactly two widgets:
   `type = 0` is a swipe button showing one value at a time, and `type = 1` is a
   radio group that draws *every* value at once. Handing a radio group a whole
-  sequence pool overflows the popup and renders as a black block — this is why
-  `pickFromList()` never puts more than `PAGE_SIZE` (8) entries in a selector,
-  and why the filter exists.
-- **`PopupInput` does not work here, and is disabled.** It is MA3's scrollable
-  list picker and would be the better widget, but on grandMA3 2.4 it returns
-  `nil` without ever drawing, which made the plugin exit silently. Its exact
-  contract could not be confirmed — the documented signature wants item
-  *descriptors*, `{ {'str', name}, ... }`, rather than the plain string array
-  older examples show, and it reportedly gained a named-parameter form
-  (`PopupInput{title=, caller=, items=}`) at some point. `caller` is also a UI
-  handle, not the display index `MessageBox` takes.
-
-  `CFG.useNativePicker` gates it, off by default. To find out what your build
-  actually wants, install **`tools/ProbeUI`** and run it: it tries every
-  convention against every plausible caller and prints which combination draws
-  a popup and what it returns. If one works, set `useNativePicker = true`.
+  sequence pool overflows the popup and renders as a black block. The drive
+  selector is the only selector left, and it holds a handful of entries.
+- **`PopupInput` does not work here.** It is MA3's scrollable list picker, but on
+  grandMA3 2.4 it returns `nil` without ever drawing, which made the plugin exit
+  silently in v1.1.0. Its contract could not be confirmed — the documented
+  signature wants item *descriptors*, `{ {'str', name}, ... }`, rather than the
+  plain string array older examples show, and it reportedly gained a
+  named-parameter form at some point. Since sequences are now entered by number,
+  no list widget is needed and the code is gone.
 
 To confirm which Lua functions exist in your exact build, run the **`HelpLua`**
 keyword on the console — it writes `grandMA3_lua_functions.txt` into the
