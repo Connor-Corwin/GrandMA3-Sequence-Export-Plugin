@@ -85,7 +85,7 @@ local CFG = {
 }
 
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.4.0"
+local PLUGIN_VERSION = "1.4.1"
 
 --- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
 --- misbehaves only on a console is otherwise pure guesswork.
@@ -542,6 +542,57 @@ local function clean(value)
   return value
 end
 
+--- Names come back from the display role wrapped in quotes -- 'Pre-Service' --
+--- which would otherwise be printed into the PDF verbatim.
+local function stripQuotes(text)
+  if #text >= 2 then
+    local first, last = text:sub(1, 1), text:sub(-1)
+    if (first == "'" and last == "'") or (first == '"' and last == '"') then
+      return text:sub(2, -2)
+    end
+  end
+  return text
+end
+
+--- A name, cleaned and unquoted.
+local function cleanName(value)
+  return stripQuotes(clean(value))
+end
+
+--- Every property name on a handle.
+---
+--- MA3 exposes PropertyCount()/PropertyName(i), 0-based, which is the only way
+--- to find a property whose name is not known in advance. Appearance is not
+--- readable on a cue as "Appearance" on every build, so it gets discovered
+--- rather than assumed.
+local function propertyNames(handle)
+  local names = {}
+  if handle == nil then return names end
+
+  local ok, count = pcall(function() return handle:PropertyCount() end)
+  if not ok or type(count) ~= "number" then return names end
+
+  for index = 0, count - 1 do
+    local gotName, name = pcall(function() return handle:PropertyName(index) end)
+    if gotName and type(name) == "string" and name ~= "" then
+      names[#names + 1] = name
+    end
+  end
+
+  return names
+end
+
+--- Every property whose name contains `needle`, case-insensitively.
+--- All of them, not just the first: a build can carry both an "Appearance"
+--- that reads nil and the one that actually holds the value.
+local function findProperties(handle, needle)
+  local found = {}
+  for _, name in ipairs(propertyNames(handle)) do
+    if name:lower():find(needle, 1, true) then found[#found + 1] = name end
+  end
+  return found
+end
+
 --- Drop trailing zeros so 1.000 prints as 1 and 2.500 as 2.5.
 local function trimZeros(text)
   if not text:find("%.") then return text end
@@ -569,7 +620,7 @@ local function identify(handle)
     local value = getNumber(handle, "No")
     no = value and trimZeros(string.format("%.3f", value)) or "?"
   end
-  return no, clean(getProp(handle, "Name"))
+  return no, cleanName(getProp(handle, "Name"))
 end
 
 --- Every data pool in the show: { {no, name, handle, active}, ... }
@@ -731,7 +782,7 @@ local function colorFromAppearance(appearance)
     end
   end
 
-  local name = clean(getProp(appearance, "Name"))
+  local name = cleanName(getProp(appearance, "Name"))
 
   return {
     r    = math.min(1, r / scale),
@@ -749,10 +800,24 @@ end
 --- a display string. That is why cue numbers arrive as "Cue 1 Blackout" rather
 --- than 1, and by the same token an Appearance arrives as its name. Indexing
 --- the pool by name turns that string back into a colour.
+--- Which property on a cue (or its part) actually holds the appearance.
+--- Discovered once per export, because "Appearance" reads nil on some builds
+--- while the real property sits under another name. Declared here so
+--- buildAppearanceIndex can reset it without leaking a global.
+local appearancePropertyCache
+
 --- Every route to a data pool's Appearances collection, in order of likelihood.
 --- Returns collection, routeName.
 local function findAppearanceCollection(dataPoolHandle)
-  local routes = {}
+  -- Appearances are a *show*-level pool, not a data pool one. A diagnostic
+  -- from a real console found nothing under the data pool by any route, which
+  -- is why these come first.
+  local routes = {
+    { name = "ShowData().Appearances",
+      get = function() return ShowData().Appearances end },
+    { name = "Root().ShowData.Appearances",
+      get = function() return Root().ShowData.Appearances end },
+  }
 
   if dataPoolHandle ~= nil then
     routes[#routes + 1] = { name = "pool.Appearances",
@@ -772,12 +837,22 @@ local function findAppearanceCollection(dataPoolHandle)
     end
   end
 
-  -- Catch-all that does not depend on the accessor spelling: walk the data
-  -- pool's own children looking for the one called Appearances.
-  for _, handle in ipairs(childrenOf(dataPoolHandle)) do
-    local name = clean(getProp(handle, "Name")):lower()
-    if name == "appearances" or name == "appearance" then
-      return handle, "child scan"
+  -- Catch-all that does not depend on the accessor spelling: walk ShowData's
+  -- and the data pool's children looking for one called Appearances.
+  local scopes = {
+    { name = "ShowData() child scan", get = function() return ShowData() end },
+    { name = "data pool child scan",  get = function() return dataPoolHandle end },
+  }
+
+  for _, scope in ipairs(scopes) do
+    local ok, parent = pcall(scope.get)
+    if ok and parent ~= nil then
+      for _, handle in ipairs(childrenOf(parent)) do
+        local name = cleanName(getProp(handle, "Name")):lower()
+        if name == "appearances" or name == "appearance" then
+          return handle, scope.name
+        end
+      end
     end
   end
 
@@ -787,6 +862,7 @@ end
 --- Name -> colour for every Appearance in a data pool.
 local function buildAppearanceIndex(dataPoolHandle)
   local index = {}
+  appearancePropertyCache = nil   -- re-detect per export
 
   local collection, route = findAppearanceCollection(dataPoolHandle)
   if collection == nil then
@@ -802,7 +878,7 @@ local function buildAppearanceIndex(dataPoolHandle)
       entries[#entries + 1] = {
         color    = color,
         position = position,
-        name     = clean(getProp(handle, "Name")),
+        name     = cleanName(getProp(handle, "Name")),
         number   = numberToken(clean(getProp(handle, "No"))),
       }
     end
@@ -855,7 +931,55 @@ end
 
 --- The colour for a cue, from a handle when that works and from the appearance
 --- name index when it does not.
-local function readAppearance(cueHandle, appearanceIndex)
+local function appearanceProperties(cueHandle, part)
+  if appearancePropertyCache ~= nil then
+    return appearancePropertyCache
+  end
+
+  local attempts = {}
+  for _, name in ipairs(findProperties(cueHandle, "appear")) do
+    attempts[#attempts + 1] = { onPart = false, property = name }
+  end
+  for _, name in ipairs(findProperties(part, "appear")) do
+    attempts[#attempts + 1] = { onPart = true, property = name }
+  end
+
+  appearancePropertyCache = attempts
+
+  local names = {}
+  for _, attempt in ipairs(attempts) do
+    names[#names + 1] = (attempt.onPart and "part." or "cue.") .. attempt.property
+  end
+  trace("appearance properties found: %s",
+    #names > 0 and table.concat(names, ", ") or "none")
+
+  return attempts
+end
+
+local function readAppearance(cueHandle, appearanceIndex, part)
+  -- Whatever the property turns out to be called on this build, try them all.
+  for _, attempt in ipairs(appearanceProperties(cueHandle, part)) do
+    local handle = attempt.onPart and part or cueHandle
+    if handle ~= nil then
+      local ok, value = pcall(function() return handle:Get(attempt.property) end)
+      if ok and value ~= nil and type(value) ~= "string" then
+        local color = colorFromAppearance(value)
+        if color ~= nil then
+          trace("appearance read from discovered property %q", attempt.property)
+          return color
+        end
+      end
+
+      local reported = cleanName(getProp(handle, attempt.property))
+      local color = lookupAppearance(appearanceIndex, reported)
+      if color ~= nil then
+        trace("appearance %q resolved via discovered property %q",
+          reported, attempt.property)
+        return color
+      end
+    end
+  end
+
   local candidates = {
     function() return cueHandle.appearance end,
     function() return cueHandle.Appearance end,
@@ -874,7 +998,7 @@ local function readAppearance(cueHandle, appearanceIndex)
   end
 
   -- Fall back to the display string, which names or references the appearance.
-  local reported = clean(getProp(cueHandle, "Appearance"))
+  local reported = cleanName(getProp(cueHandle, "Appearance"))
   if reported ~= "" then
     local color = lookupAppearance(appearanceIndex, reported)
     if color ~= nil then
@@ -919,7 +1043,7 @@ local function stripCueLabel(name, number)
   if trimZeros(prefix) ~= number then return name end
 
   local stripped = name:gsub("^%s*[Cc][Uu][Ee]%s+%d+%.?%d*%s*", "")
-  return (stripped:match("^%s*(.-)%s*$"))
+  return stripQuotes(stripped:match("^%s*(.-)%s*$"))
 end
 
 --- MA3 hangs a CueZero and an OffCue off every sequence. Neither belongs on a
@@ -1021,11 +1145,51 @@ local function buildAppearanceReport(dataPoolHandle, sequenceHandle, index)
   end
   add("")
 
+  -- Every property a cue and its part actually have. This is the part that
+  -- settles it: if the appearance is exposed under some other name, it is in
+  -- this list. MA3 offers PropertyCount()/PropertyName(), 0-based.
+  add("== every property of the first real cue ==")
+  local sample, samplePart
+  for _, cueHandle in ipairs(childrenOf(sequenceHandle)) do
+    local number = cueNumber(cueHandle)
+    local name   = cleanName(getProp(cueHandle, "Name"))
+    if not isSpecialCue(name, number) then
+      sample = cueHandle
+      samplePart = childrenOf(cueHandle)[1]
+      local ok, first = pcall(function() return cueHandle[1] end)
+      if ok and first ~= nil then samplePart = first end
+      break
+    end
+  end
+
+  if sample == nil then
+    add("  no ordinary cue found in this sequence")
+  else
+    for _, subject in ipairs({
+      { label = "cue",  handle = sample },
+      { label = "part", handle = samplePart },
+    }) do
+      local names = propertyNames(subject.handle)
+      if #names == 0 then
+        add("  %s: PropertyCount()/PropertyName() unavailable, or no properties",
+          subject.label)
+      else
+        add("  %s has %d propert%s:", subject.label, #names,
+          #names == 1 and "y" or "ies")
+        for _, property in ipairs(names) do
+          local ok, value = pcall(function() return subject.handle:Get(property) end)
+          add("    %-24s %s", property, ok and describeValue(value) or "ERROR")
+        end
+      end
+    end
+  end
+  add("")
+
   add("== what each cue reports for its Appearance ==")
   local shown = 0
   for _, cueHandle in ipairs(childrenOf(sequenceHandle)) do
     local number = cueNumber(cueHandle)
-    local name   = clean(getProp(cueHandle, "Name"))
+    local name   = cleanName(getProp(cueHandle, "Name"))
 
     -- Skip CueZero and OffCue so the sample is real cues.
     if not isSpecialCue(name, number) then
@@ -1096,12 +1260,12 @@ local function collectCues(sequenceHandle, appearanceIndex)
     end
 
     local number = cueNumber(cueHandle)
-    local name   = stripCueLabel(clean(getProp(cueHandle, "Name")), number)
+    local name   = stripCueLabel(cleanName(getProp(cueHandle, "Name")), number)
 
     if CFG.hideSpecialCues and isSpecialCue(name, number) then
       trace("skipping special cue %q (no %q)", name, number)
     else
-      local fromShow = readAppearance(cueHandle, appearanceIndex)
+      local fromShow = readAppearance(cueHandle, appearanceIndex, part)
 
       cues[#cues + 1] = {
         no             = number,
@@ -1796,6 +1960,9 @@ if _G.SEQUENCE_EXPORT_TESTING then
     lookupAppearance = lookupAppearance,
     findAppearanceCollection = findAppearanceCollection,
     manualSection    = manualSection,
+    stripQuotes      = stripQuotes,
+    propertyNames    = propertyNames,
+    findProperties   = findProperties,
     buildAppearanceReport = buildAppearanceReport,
     findDataPool     = findDataPool,
     describePools    = describePools,

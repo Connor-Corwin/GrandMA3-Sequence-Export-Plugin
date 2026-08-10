@@ -320,6 +320,48 @@ for _, collection in ipairs({ "Appearances", "Appearance", "children" }) do
 end
 mock.appearanceCollection = "Appearances"
 
+-- A diagnostic from a real console found no Appearance pool anywhere under the
+-- data pool: it is a show-level pool. And the cue's appearance was not readable
+-- as "Appearance" at all, so the property is discovered by enumeration rather
+-- than assumed.
+for _, scope in ipairs({ "datapool", "showdata" }) do
+  for _, property in ipairs({ "Appearance", "CueAppearanceRef" }) do
+    mock.appearanceScope = scope
+    mock.appearanceProperty = property
+    mock.install()
+    mock.setUsbPath(OUT_DIR)
+    local color = firstCueColor()
+    check(string.format("pool at %s, cue property %s: resolved", scope, property),
+      isOpeningBlue(color), describeColor(color))
+  end
+end
+mock.appearanceScope = "datapool"
+mock.appearanceProperty = "Appearance"
+
+print("\n== property enumeration ==")
+
+mock.install()
+local samplePools = internals.listDataPools()
+local names = internals.propertyNames(
+  internals.listSequences(samplePools[2].handle)[1].handle)
+check("properties can be enumerated off a handle", #names > 0, #names)
+check("an appearance-ish property is found by pattern",
+  #internals.findProperties(samplePools[2].handle, "sequence") >= 0)
+
+print("\n== quoted names ==")
+
+check("a fully quoted name is unquoted",
+  internals.stripQuotes("'Pre-Service'") == "Pre-Service")
+check("a double-quoted name is unquoted",
+  internals.stripQuotes('"Pre-Service"') == "Pre-Service")
+check("an unquoted name is untouched",
+  internals.stripQuotes("Pre-Service") == "Pre-Service")
+check("a quoted name behind a cue label is unquoted",
+  internals.stripCueLabel("Cue 4.001 'Words ON'", "4.001") == "Words ON",
+  internals.stripCueLabel("Cue 4.001 'Words ON'", "4.001"))
+check("an apostrophe inside a name survives",
+  internals.stripQuotes("It's Amazing") == "It's Amazing")
+
 mock.install()
 mock.setUsbPath(OUT_DIR)
 

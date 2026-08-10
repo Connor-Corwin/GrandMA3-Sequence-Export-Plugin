@@ -51,6 +51,24 @@ function Handle:Children()
   return rawget(self, "_kids")
 end
 
+--- MA3 exposes property enumeration, 0-based, which is the only way to find a
+--- property whose name is not known in advance.
+function Handle:PropertyCount()
+  local names = rawget(self, "_order")
+  if names == nil then
+    names = {}
+    for name in pairs(rawget(self, "_props")) do names[#names + 1] = name end
+    table.sort(names)
+    rawset(self, "_order", names)
+  end
+  return #names
+end
+
+function Handle:PropertyName(index)
+  self:PropertyCount()
+  return rawget(self, "_order")[index + 1]
+end
+
 --=============================================================================
 -- Synthetic show
 --=============================================================================
@@ -81,6 +99,16 @@ M.appearanceRef = "name"
 --- Where the Appearances collection hangs off the data pool:
 ---   "Appearances" | "Appearance" | "children" (found only by scanning)
 M.appearanceCollection = "Appearances"
+
+--- Which property on a cue holds the appearance. "Appearance" is the obvious
+--- one; "CueAppearanceRef" stands in for a build that names it something else,
+--- reachable only by enumerating properties.
+M.appearanceProperty = "Appearance"
+
+--- Where the Appearances pool lives: "datapool" or "showdata". A diagnostic
+--- from a real console found nothing under the data pool, so show level is
+--- the case that matters.
+M.appearanceScope = "datapool"
 
 --- Stable pool number per appearance, so a cue can reference it by number.
 local APPEARANCE_NUMBERS = {}
@@ -150,8 +178,9 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
   --   * cue.appearance is nil and Get("Appearance", Display) returns only the
   --     appearance's *name*, so reading colour off a handle finds nothing and
   --     every cue exported uncoloured.
+  -- The display role quotes names: Cue 1 'House to Half'.
   local label = "Cue " .. no
-  if name ~= "" then label = label .. " " .. name end
+  if name ~= "" then label = label .. " '" .. name .. "'" end
 
   -- Name comes back through the display role as well, so it arrives as the
   -- whole label too -- which is why the Name column read "Cue 1 Blackout"
@@ -161,7 +190,16 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
       No         = label,
       Name       = label,
       Note       = note,
-      Appearance = function() return appearanceReference(appearanceSpec) end,
+      Appearance = function()
+        if M.appearanceProperty ~= "Appearance" then return nil end
+        return appearanceReference(appearanceSpec)
+      end,
+      -- Some builds expose it under another name entirely, findable only by
+      -- enumerating properties.
+      CueAppearanceRef = function()
+        if M.appearanceProperty ~= "CueAppearanceRef" then return nil end
+        return appearanceReference(appearanceSpec)
+      end,
     },
     { note = note },
     { part })
@@ -328,6 +366,12 @@ local function buildDataPool(sequences)
   local pool = newHandle({}, { sequences = sequencePool }, children)
   rawget(pool, "_attrs").Sequences = sequencePool
 
+  -- On a real console the pool was found nowhere under the data pool; it is a
+  -- show-level pool. In that mode nothing is hung here at all.
+  if M.appearanceScope == "showdata" then
+    return pool
+  end
+
   if M.appearanceCollection == "Appearance" then
     rawget(pool, "_attrs").Appearance = appearancePool
   elseif M.appearanceCollection == "children" then
@@ -367,8 +411,19 @@ function M.install()
   if M.twoDataPools ~= false then pools[#pools + 1] = poolTwo end
 
   local dataPools = newHandle({}, {}, pools)
-  local showData = newHandle({}, { datapools = dataPools })
+
+  local showChildren = {}
+  local showData = newHandle({}, { datapools = dataPools }, showChildren)
   rawget(showData, "_attrs").DataPools = dataPools
+
+  if M.appearanceScope == "showdata" then
+    local showAppearances = newHandle({ Name = "Appearances" }, {}, APPEARANCE_POOL)
+    if M.appearanceCollection == "children" then
+      showChildren[#showChildren + 1] = showAppearances
+    else
+      rawget(showData, "_attrs").Appearances = showAppearances
+    end
+  end
 
   local root = newHandle({}, {
     temp = temp, manetsocket = manetsocket, showdata = showData,

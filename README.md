@@ -215,11 +215,21 @@ cell rather than aborting the export. Two specifics worth knowing:
   refers to its Appearance, not where the Appearance pool hangs. The plugin
   therefore covers a matrix rather than one path — `colorChannel()` reads a
   plain value then the display role and detects percentages, `combinedColor()`
-  handles a single `BackColor`, `findAppearanceCollection()` tries four
-  accessors then scans the data pool's children, and `buildAppearanceIndex()`
+  handles a single `BackColor`, `findAppearanceCollection()` tries six
+  accessors then scans children, and `buildAppearanceIndex()`
   keys each Appearance by name, number, `appearance <n>` and position so any
   form a cue reports resolves. Position is claimed in a second pass so it can
   never shadow a real pool number — pool order is not the same as numbering.
+- **Appearances are a show-level pool**, `ShowData().Appearances`, not a data
+  pool one. A diagnostic from a real console found nothing under the data pool
+  by any route.
+- **A cue's appearance property is not reliably called `Appearance`** — on a real
+  console it reads `nil` through `Get()`, the display role and attribute access
+  alike. MA3 exposes `handle:PropertyCount()` and `handle:PropertyName(i)`
+  (0-based), so `findProperties()` enumerates a cue's and its part's properties
+  and tries *every* one whose name contains `appear`, rather than assuming.
+- **Names come back quoted** — `Cue 4.001 'Words ON'`. `stripQuotes()` runs after
+  the cue-label prefix is removed, so the quotes do not survive into the PDF.
 - When an export reads no color at all it writes an
   `-appearance-report.txt` beside the PDF dumping every one of those routes and
   what MA3 returned, so a failure explains itself instead of costing a round of
