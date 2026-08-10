@@ -17,7 +17,7 @@ import pymupdf
 EXPECTED_TEXT = [
     "Act One (Main)",        # sequence name, the bold title
     "Sequence 12",           # meta line
-    "Cue", "Name", "Fade", "Delay", "Note",   # column headers
+    "Cue", "Name", "Fade", "Delay", "Cmd", "Note",   # column headers
     # Sections are now titled by the cue that carries the Appearance, so the
     # Appearance's own name ("01 Opening") is deliberately absent.
     "It Really Is Amazing Grace",
@@ -156,6 +156,28 @@ def main(path: str) -> int:
     for appearance_name in ("01 Opening", "02 Ballad", "03 Big Chorus"):
         check(f"the Appearance name {appearance_name!r} is not used as a label",
               appearance_name.lower() not in lowered)
+
+    # The Cmd column flags that a cue fires a command. The command itself must
+    # never be printed -- the user asked for the flag, not the text.
+    check("commanded cues are flagged", "CMD" in text, "no CMD marker found")
+    for command_text in ("Go Sequence 5", "Off Sequence 7", "Goto Cue 9"):
+        check(f"the command text {command_text!r} never reaches the page",
+              command_text.lower() not in lowered)
+
+    # Cmd must sit between Delay and Note, by x position on the page.
+    header_spans = {
+        span["text"].strip(): span["bbox"][0]
+        for block in first.get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        for span in line["spans"]
+        if span["text"].strip() in ("Cue", "Name", "Fade", "Delay", "Cmd", "Note")
+    }
+    check("the Cmd header is present", "Cmd" in header_spans,
+          str(sorted(header_spans)))
+    if {"Delay", "Cmd", "Note"} <= header_spans.keys():
+        check("Cmd sits between Delay and Note",
+              header_spans["Delay"] < header_spans["Cmd"] < header_spans["Note"],
+              str({k: round(v) for k, v in header_spans.items()}))
 
     # The section header IS the cue's row, so a song title appears once, not
     # once in a band and again in the row beneath it.

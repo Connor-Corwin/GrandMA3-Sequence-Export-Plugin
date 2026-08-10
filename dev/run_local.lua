@@ -391,6 +391,59 @@ check("a section head with no name falls back to its cue number",
   byNumber["59.5"] ~= nil and byNumber["59.5"].name == "",
   byNumber["59.5"] and byNumber["59.5"].name)
 
+print("\n== the Cmd column ==")
+
+-- The property name is not documented anywhere reachable, and every property
+-- guessed in this plugin has been wrong at least once, so it is discovered.
+-- Cover the shapes it can take: on the cue or its part, under the obvious name
+-- or one only findable by enumerating properties.
+for _, shape in ipairs({
+  { property = "Command",          onPart = false, label = "Command on the cue" },
+  { property = "Command",          onPart = true,  label = "Command on the part" },
+  { property = "TriggerCmdString", onPart = false, label = "odd property, cue" },
+  { property = "TriggerCmdString", onPart = true,  label = "odd property, part" },
+}) do
+  mock.commandProperty = shape.property
+  mock.commandOnPart = shape.onPart
+  mock.install()
+  mock.setUsbPath(OUT_DIR)
+
+  local cmdPools = internals.listDataPools()
+  local cmdCues = internals.collectCues(
+    internals.listSequences(cmdPools[2].handle)[1].handle,
+    internals.buildAppearanceIndex(cmdPools[2].handle))
+
+  local flags = {}
+  for _, cue in ipairs(cmdCues) do flags[cue.no] = cue.command end
+
+  check(shape.label .. ": a commanded cue is flagged", flags["57.1"] == "CMD",
+    tostring(flags["57.1"]))
+  check(shape.label .. ": an empty command is not flagged", flags["57.4"] == "",
+    tostring(flags["57.4"]))
+  check(shape.label .. ": a cue with no command is not flagged", flags["57.5"] == "",
+    tostring(flags["57.5"]))
+end
+
+mock.commandProperty = "Command"
+mock.commandOnPart = false
+mock.install()
+mock.setUsbPath(OUT_DIR)
+
+-- The column table drives the header, the rows and the wrapping, so a width
+-- edit that does not add up would silently push text off the page.
+local totalWidth = 0
+local columnOrder = {}
+for _, column in ipairs(internals.COLUMNS) do
+  totalWidth = totalWidth + column.width
+  columnOrder[#columnOrder + 1] = column.label
+end
+check("column widths sum to the content width",
+  totalWidth == internals.CFG.pageWidth - 2 * internals.CFG.margin,
+  totalWidth .. " vs " .. (internals.CFG.pageWidth - 2 * internals.CFG.margin))
+check("Cmd sits between Delay and Note",
+  table.concat(columnOrder, ",") == "Cue,Name,Fade,Delay,Cmd,Note",
+  table.concat(columnOrder, ","))
+
 print("\n== manual sections ==")
 
 check("a cue outside every range gets nothing",

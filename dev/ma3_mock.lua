@@ -110,6 +110,12 @@ M.appearanceProperty = "Appearance"
 --- the case that matters.
 M.appearanceScope = "datapool"
 
+--- Which property holds a cue's command, and whether it lives on the cue or on
+--- its part. "TriggerCmdString" stands in for a build that names it something
+--- the plugin cannot know in advance, reachable only by enumeration.
+M.commandProperty = "Command"
+M.commandOnPart = false
+
 --- Stable pool number per appearance, so a cue can reference it by number.
 local APPEARANCE_NUMBERS = {}
 do
@@ -165,10 +171,19 @@ end
 --- Every appearance in the show, as the Appearances pool holds them.
 local APPEARANCE_POOL = {}
 
-local function cueHandle(no, name, fade, delay, note, appearanceSpec)
-  local part = newHandle(
-    { CueFade = fade, CueDelay = delay },
-    { cuefade = fade, cuedelay = delay })
+--- commandText: the command on this cue, or nil/"" for none.
+---
+--- Every cue declares the command property whether or not it holds anything,
+--- because on a real console all cues are the same class and so carry the same
+--- property list. Which property, and whether it sits on the cue or its part,
+--- is a show-wide switch -- M.commandProperty and M.commandOnPart.
+local function cueHandle(no, name, fade, delay, note, appearanceSpec, commandText)
+  local partProps = { CueFade = fade, CueDelay = delay }
+  if M.commandOnPart then
+    partProps[M.commandProperty] = commandText or ""
+  end
+
+  local part = newHandle(partProps, { cuefade = fade, cuedelay = delay })
 
   -- Reproduce what the console actually does, which is what broke v1.2.0:
   --
@@ -185,8 +200,7 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
   -- Name comes back through the display role as well, so it arrives as the
   -- whole label too -- which is why the Name column read "Cue 1 Blackout"
   -- while the Cue column beside it already said 1.
-  local cue = newHandle(
-    {
+  local cueProps = {
       No         = label,
       Name       = label,
       Note       = note,
@@ -200,9 +214,13 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
         if M.appearanceProperty ~= "CueAppearanceRef" then return nil end
         return appearanceReference(appearanceSpec)
       end,
-    },
-    { note = note },
-    { part })
+  }
+
+  if not M.commandOnPart then
+    cueProps[M.commandProperty] = commandText or ""
+  end
+
+  local cue = newHandle(cueProps, { note = note }, { part })
 
   -- The plugin reads the first cue part as cue[1]; mirror that.
   rawget(cue, "_attrs")[1] = part
@@ -294,6 +312,12 @@ local function buildLongSequence()
   -- than running off the bottom edge.
   add("57", "Runaway Note", "3", "0",
     string.rep("This note is absurdly long and must be clipped to fit. ", 120), nil)
+
+  -- Commands. The text must never reach the PDF, only the marker.
+  add("57.1", "Video Go",       "0", "0", "", nil, "Go Sequence 5")
+  add("57.2", "Lights Restore", "0", "0", "", nil, "Off Sequence 7")
+  add("57.4", "Empty Command",  "0", "0", "", nil, "")
+  add("57.5", "No Command",     "0", "0", "", nil, nil)
 
   add("60", "Encore In",  "5", "0", "Audience blinders at 40%", APPEARANCES.encore)
   for i = 1, 8 do

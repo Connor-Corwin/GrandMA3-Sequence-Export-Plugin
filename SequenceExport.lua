@@ -43,7 +43,8 @@ local CFG = {
   colName  = 150,
   colFade  = 45,
   colDelay = 45,
-  colNote  = 245,
+  colCmd   = 38,
+  colNote  = 207,
 
   cellPad = 4,        -- horizontal padding inside a column
 
@@ -66,6 +67,10 @@ local CFG = {
   -- not cues anyone wants on a printed cue sheet.
   hideSpecialCues = true,
 
+  -- What the Cmd column shows for a cue that fires a command. The command
+  -- itself is never printed, only that there is one.
+  commandMarker = "CMD",
+
   -- Which data pool to export from. Leave nil to be asked each run, with the
   -- field prefilled from whichever pool is active. Set a number -- dataPool = 2
   -- -- to lock it in; the field then disappears and the dialog only asks for a
@@ -85,7 +90,7 @@ local CFG = {
 }
 
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.5.0"
+local PLUGIN_VERSION = "1.6.0"
 
 --- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
 --- misbehaves only on a console is otherwise pure guesswork.
@@ -593,6 +598,57 @@ local function findProperties(handle, needle)
   return found
 end
 
+--- Which properties on a cue or its part might hold a command.
+--- Discovered once per export: the property name is not documented anywhere
+--- reachable, and every property name guessed in this plugin so far has been
+--- wrong at least once.
+local commandPropertyCache
+
+local function commandProperties(cueHandle, part)
+  if commandPropertyCache ~= nil then return commandPropertyCache end
+
+  local attempts = {}
+  local seen = {}
+
+  local function consider(onPart, name)
+    local key = tostring(onPart) .. name:lower()
+    if not seen[key] then
+      seen[key] = true
+      attempts[#attempts + 1] = { onPart = onPart, property = name }
+    end
+  end
+
+  -- The obvious spellings first, then anything the object actually declares.
+  for _, name in ipairs({ "Command", "Cmd", "CmdText" }) do
+    consider(false, name)
+    consider(true, name)
+  end
+  for _, needle in ipairs({ "command", "cmd" }) do
+    for _, name in ipairs(findProperties(cueHandle, needle)) do consider(false, name) end
+    for _, name in ipairs(findProperties(part, needle)) do consider(true, name) end
+  end
+
+  commandPropertyCache = attempts
+  return attempts
+end
+
+--- Does this cue fire a command? Only whether one exists -- the command text
+--- is deliberately never read into the sheet.
+local function hasCommand(cueHandle, part)
+  for _, attempt in ipairs(commandProperties(cueHandle, part)) do
+    local handle = attempt.onPart and part or cueHandle
+    if handle ~= nil then
+      local value = clean(getProp(handle, attempt.property))
+      if value ~= "" then
+        trace("command found on %s%s",
+          attempt.onPart and "part." or "cue.", attempt.property)
+        return true
+      end
+    end
+  end
+  return false
+end
+
 --- Drop trailing zeros so 1.000 prints as 1 and 2.500 as 2.5.
 local function trimZeros(text)
   if not text:find("%.") then return text end
@@ -862,7 +918,9 @@ end
 --- Name -> colour for every Appearance in a data pool.
 local function buildAppearanceIndex(dataPoolHandle)
   local index = {}
-  appearancePropertyCache = nil   -- re-detect per export
+  -- Re-detect per export; a different show may name these differently.
+  appearancePropertyCache = nil
+  commandPropertyCache = nil
 
   local collection, route = findAppearanceCollection(dataPoolHandle)
   if collection == nil then
@@ -1274,6 +1332,7 @@ local function collectCues(sequenceHandle, appearanceIndex)
         note           = clean(getProp(cueHandle, "Note")),
         fade           = clean(getProp(part, "CueFade")),
         delay          = clean(getProp(part, "CueDelay")),
+        command        = hasCommand(cueHandle, part) and CFG.commandMarker or "",
         appearance     = manualSection(number) or fromShow,
         -- Tracked separately so the export can tell whether the show gave up
         -- anything at all, and write a diagnostic report when it did not.
@@ -1332,6 +1391,8 @@ local COLUMNS = {
   { key = "name",  label = "Name",  width = CFG.colName,  wrap = false },
   { key = "fade",  label = "Fade",  width = CFG.colFade,  wrap = false },
   { key = "delay", label = "Delay", width = CFG.colDelay, wrap = false },
+  -- Flags that a cue fires a command, without printing the command itself.
+  { key = "command", label = "Cmd", width = CFG.colCmd, wrap = false },
   { key = "note",  label = "Note",  width = CFG.colNote,  wrap = true  },
 }
 
@@ -1499,11 +1560,12 @@ local function renderDocument(sequenceName, sequenceNumber, cues, showfile)
 
     -- Measure the row before committing it, so a row never straddles a page.
     local values = {
-      no    = cue.no,
-      name  = cue.name,
-      fade  = cue.fade,
-      delay = cue.delay,
-      note  = cue.note,
+      no      = cue.no,
+      name    = cue.name,
+      fade    = cue.fade,
+      delay   = cue.delay,
+      command = cue.command,
+      note    = cue.note,
     }
 
     local cells, lineCount = {}, 1
@@ -2010,6 +2072,8 @@ if _G.SEQUENCE_EXPORT_TESTING then
     lookupAppearance = lookupAppearance,
     findAppearanceCollection = findAppearanceCollection,
     manualSection    = manualSection,
+    hasCommand       = hasCommand,
+    COLUMNS          = COLUMNS,
     stripQuotes      = stripQuotes,
     propertyNames    = propertyNames,
     findProperties   = findProperties,

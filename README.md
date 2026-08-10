@@ -1,7 +1,7 @@
 # GrandMA3 Sequence Export Plugin
 
 Exports a grandMA3 sequence as a printable PDF cue sheet — cue number, name,
-fade, delay and note — with the sequence name as the title and each cue's
+fade, delay, a command flag and note — with the sequence name as the title and each cue's
 **Appearance** color carried over so songs and sections stay visible at a glance.
 
 Runs unchanged on a console or on onPC. No external tools, no dependencies:
@@ -24,6 +24,9 @@ the PDF bytes are generated in pure Lua, because MA3 ships no PDF library.
 - **Sub-cues** — `58.001`, `58.002` under cue `58` — are tinted with their
   song's color. Cues that are not sub-cues of the section head end the block and
   fall back to plain zebra striping, so a color never bleeds past its song.
+- A **Cmd** column between Delay and Note flags cues that fire a command. It
+  shows only that there *is* one — the command text is never printed. Change the
+  marker with `CFG.commandMarker`.
 - Long notes **word-wrap** and the row grows to fit. Page breaks repeat the
   column headers and re-draw the current section band marked `(cont.)`.
 
@@ -259,6 +262,11 @@ cell rather than aborting the export. Two specifics worth knowing:
   plain string array older examples show, and it reportedly gained a
   named-parameter form at some point. Since sequences are now entered by number,
   no list widget is needed and the code is gone.
+
+- **A cue's command property is discovered the same way.** `Command`, `Cmd` and
+  `CmdText` are tried first, then any cue or part property whose name contains
+  `cmd` or `command`. Only whether it is non-empty is read; the text is never
+  loaded into the sheet.
 
 To confirm which Lua functions exist in your exact build, run the **`HelpLua`**
 keyword on the console — it writes `grandMA3_lua_functions.txt` into the
