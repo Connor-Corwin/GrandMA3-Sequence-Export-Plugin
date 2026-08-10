@@ -265,32 +265,80 @@ check("the name column holds the name alone, not the whole label",
 check("an unnamed cue stays empty rather than showing its label",
   cues[4].name == "", cues[4].name)
 
--- Which way a build exposes appearance colour is not known, so cover them all
--- rather than betting on one. Every mode must yield the same colour.
+-- None of this is reproducible away from a console and colour has failed three
+-- times, so cover the whole matrix rather than betting on one combination:
+-- how the colour value is exposed, how a cue refers to its appearance, and
+-- where the Appearances collection hangs off the data pool.
 print("\n== appearance colour, however the console exposes it ==")
+
+local function firstCueColor()
+  local modePools = internals.listDataPools()
+  return internals.collectCues(
+    internals.listSequences(modePools[2].handle)[1].handle,
+    internals.buildAppearanceIndex(modePools[2].handle))[1].appearance
+end
+
+local function isOpeningBlue(color)
+  return color ~= nil
+    and math.abs(color.r - 32 / 255) < 0.01
+    and math.abs(color.g - 78 / 255) < 0.01
+    and math.abs(color.b - 168 / 255) < 0.01
+end
+
+local function describeColor(color)
+  if color == nil then return "NO COLOUR" end
+  return string.format("%.3f,%.3f,%.3f", color.r, color.g, color.b)
+end
 
 for _, mode in ipairs({ "numbers", "display", "percent", "combined" }) do
   mock.appearanceMode = mode
   mock.install()
   mock.setUsbPath(OUT_DIR)
-
-  local modePools = internals.listDataPools()
-  local modeCues = internals.collectCues(
-    internals.listSequences(modePools[2].handle)[1].handle,
-    internals.buildAppearanceIndex(modePools[2].handle))
-
-  local color = modeCues[1].appearance
-  check(mode .. ": the colour is read and is the right one",
-    color ~= nil
-      and math.abs(color.r - 32 / 255) < 0.01
-      and math.abs(color.g - 78 / 255) < 0.01
-      and math.abs(color.b - 168 / 255) < 0.01,
-    color and string.format("%.3f,%.3f,%.3f", color.r, color.g, color.b) or "NO COLOUR")
+  local color = firstCueColor()
+  check("value as " .. mode .. ": the right colour is read",
+    isOpeningBlue(color), describeColor(color))
 end
-
 mock.appearanceMode = "numbers"
+
+for _, ref in ipairs({ "name", "number", "reference" }) do
+  mock.appearanceRef = ref
+  mock.install()
+  mock.setUsbPath(OUT_DIR)
+  local color = firstCueColor()
+  check("cue refers to its appearance by " .. ref .. ": resolved",
+    isOpeningBlue(color), describeColor(color))
+end
+mock.appearanceRef = "name"
+
+for _, collection in ipairs({ "Appearances", "Appearance", "children" }) do
+  mock.appearanceCollection = collection
+  mock.install()
+  mock.setUsbPath(OUT_DIR)
+  local color = firstCueColor()
+  check("pool reachable via " .. collection .. ": resolved",
+    isOpeningBlue(color), describeColor(color))
+end
+mock.appearanceCollection = "Appearances"
+
 mock.install()
 mock.setUsbPath(OUT_DIR)
+
+print("\n== manual sections ==")
+
+check("a cue outside every range gets nothing",
+  internals.manualSection("5") == nil)
+
+internals.CFG.sections = {
+  { from = 1, to = 13, name = "Opening Set", color = { 10, 20, 30 } },
+}
+local manual = internals.manualSection("2.5")
+check("a cue inside a range gets that section",
+  manual ~= nil and manual.name == "Opening Set"
+    and math.abs(manual.r - 10 / 255) < 0.01,
+  manual and manual.name or "nil")
+check("a decimal cue number is matched numerically",
+  internals.manualSection("13") ~= nil and internals.manualSection("13.5") == nil)
+internals.CFG.sections = {}
 
 local drives = internals.listDrives()
 check("drives are listed with removable first",
@@ -411,6 +459,81 @@ check("nothing was asked before the error", #mock.dialogLog == 1,
   #mock.dialogLog .. " dialogs")
 
 internals.CFG.dataPool = nil
+
+print("\n== when the show yields no colour, a diagnostic is written ==")
+
+mock.appearanceRef = "none"
+mock.install()
+mock.setUsbPath(OUT_DIR)
+reset()
+mock.answers = {
+  { result = 1, inputs = { ["Data pool"] = "2", ["Sequence"] = "12" } },
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "nocolour" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+local report = io.open(OUT_DIR .. "/nocolour-appearance-report.txt", "rb")
+check("a report was written next to the PDF", report ~= nil)
+if report then
+  local body = report:read("a")
+  report:close()
+  check("it says where the appearance pool was found",
+    body:find("appearance collection", 1, true) ~= nil
+      or body:find("found via", 1, true) ~= nil)
+  check("it lists what each appearance reports",
+    body:find("BackR", 1, true) ~= nil)
+  check("it lists what each cue reports",
+    body:find("what each cue reports", 1, true) ~= nil)
+  check("it records the lookup keys that were built",
+    body:find("lookup keys", 1, true) ~= nil)
+end
+check("the done dialog mentions the diagnostic",
+  mock.offered[#mock.offered].message:find("diagnostic", 1, true) ~= nil,
+  mock.offered[#mock.offered].message)
+
+print("\n== no diagnostic when colours do work ==")
+
+mock.appearanceRef = "name"
+mock.install()
+mock.setUsbPath(OUT_DIR)
+reset()
+mock.answers = {
+  { result = 1, inputs = { ["Data pool"] = "2", ["Sequence"] = "12" } },
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "withcolour" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+check("no report file was written",
+  io.open(OUT_DIR .. "/withcolour-appearance-report.txt", "rb") == nil)
+
+print("\n== manual sections colour the export on their own ==")
+
+mock.appearanceRef = "none"
+mock.install()
+mock.setUsbPath(OUT_DIR)
+internals.CFG.sections = {
+  { from = 1,  to = 13, name = "Opening Set", color = {  32,  78, 168 } },
+  { from = 14, to = 27, name = "The Ballad",  color = { 250, 236, 130 } },
+}
+reset()
+mock.answers = {
+  { result = 1, inputs = { ["Data pool"] = "2", ["Sequence"] = "12" } },
+  { result = 1 },
+  { result = 1, selectors = { Drive = 1 }, inputs = { ["File name"] = "manual" } },
+  { result = 1 },
+}
+Main({ index = 1 }, nil)
+
+check("the manual section names reached the PDF",
+  fileContains("manual.pdf", "Opening Set") and fileContains("manual.pdf", "The Ballad"))
+
+internals.CFG.sections = {}
+mock.appearanceRef = "name"
+mock.install()
+mock.setUsbPath(OUT_DIR)
 
 print("\n== a blank data pool field falls back to the active pool ==")
 

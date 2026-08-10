@@ -40,7 +40,11 @@ end
 M.newHandle = newHandle
 
 function Handle:Get(name, _role)
-  return rawget(self, "_props")[name]
+  local value = rawget(self, "_props")[name]
+  -- A function value is resolved on read, so switches like M.appearanceRef
+  -- take effect without rebuilding the whole synthetic show.
+  if type(value) == "function" then return value() end
+  return value
 end
 
 function Handle:Children()
@@ -67,33 +71,66 @@ local APPEARANCES = {
 ---   "combined" - one BackColor property holding all three channels
 M.appearanceMode = "numbers"
 
+--- What a cue reports for its Appearance:
+---   "name"      - the appearance's name, e.g. "01 Opening"
+---   "number"    - its pool number, e.g. "3"
+---   "reference" - a reference, e.g. "Appearance 3"
+---   "none"      - nothing at all, the case that triggers the report
+M.appearanceRef = "name"
+
+--- Where the Appearances collection hangs off the data pool:
+---   "Appearances" | "Appearance" | "children" (found only by scanning)
+M.appearanceCollection = "Appearances"
+
+--- Stable pool number per appearance, so a cue can reference it by number.
+local APPEARANCE_NUMBERS = {}
+do
+  local names = {}
+  for _, spec in pairs(APPEARANCES) do names[#names + 1] = spec.name end
+  table.sort(names)
+  for position, name in ipairs(names) do APPEARANCE_NUMBERS[name] = position end
+end
+
+--- How a cue refers to its appearance, per M.appearanceRef.
+local function appearanceReference(spec)
+  if spec == nil then return "" end
+  local number = APPEARANCE_NUMBERS[spec.name]
+  if M.appearanceRef == "number" then return tostring(number) end
+  if M.appearanceRef == "reference" then return "Appearance " .. number end
+  if M.appearanceRef == "none" then return "" end
+  return spec.name
+end
+
 local function appearanceHandle(spec)
   if spec == nil then return nil end
 
   local mode = M.appearanceMode
+  local number = tostring(APPEARANCE_NUMBERS[spec.name] or 0)
 
   if mode == "display" then
     return newHandle(
-      { Name = spec.name, BackR = tostring(spec.r), BackG = tostring(spec.g),
-        BackB = tostring(spec.b), BackAlpha = "255" }, { name = spec.name })
+      { No = number, Name = spec.name, BackR = tostring(spec.r),
+        BackG = tostring(spec.g), BackB = tostring(spec.b), BackAlpha = "255" },
+      { name = spec.name })
   end
 
   if mode == "percent" then
     local function pct(value) return string.format("%.1f%%", value / 255 * 100) end
     return newHandle(
-      { Name = spec.name, BackR = pct(spec.r), BackG = pct(spec.g),
+      { No = number, Name = spec.name, BackR = pct(spec.r), BackG = pct(spec.g),
         BackB = pct(spec.b), BackAlpha = "100%" }, { name = spec.name })
   end
 
   if mode == "combined" then
     return newHandle(
-      { Name = spec.name,
+      { No = number, Name = spec.name,
         BackColor = string.format("%d,%d,%d", spec.r, spec.g, spec.b) },
       { name = spec.name })
   end
 
   return newHandle(
-    { Name = spec.name, BackR = spec.r, BackG = spec.g, BackB = spec.b, BackAlpha = 255 },
+    { No = number, Name = spec.name, BackR = spec.r, BackG = spec.g,
+      BackB = spec.b, BackAlpha = 255 },
     { name = spec.name, backr = spec.r, backg = spec.g, backb = spec.b, backalpha = 255 })
 end
 
@@ -124,7 +161,7 @@ local function cueHandle(no, name, fade, delay, note, appearanceSpec)
       No         = label,
       Name       = label,
       Note       = note,
-      Appearance = appearanceSpec and appearanceSpec.name or "",
+      Appearance = function() return appearanceReference(appearanceSpec) end,
     },
     { note = note },
     { part })
@@ -149,8 +186,13 @@ end
 
 --- Rebuilt on every install() so a changed appearanceMode takes effect.
 local function rebuildAppearancePool()
+  local specs = {}
+  for _, spec in pairs(APPEARANCES) do specs[#specs + 1] = spec end
+  -- pairs() order is arbitrary; sort so the pool is deterministic.
+  table.sort(specs, function(a, b) return a.name < b.name end)
+
   APPEARANCE_POOL = {}
-  for _, spec in pairs(APPEARANCES) do
+  for _, spec in ipairs(specs) do
     APPEARANCE_POOL[#APPEARANCE_POOL + 1] = appearanceHandle(spec)
   end
 end
@@ -278,13 +320,25 @@ local function buildDataPool(sequences)
     rawget(sequencePool, "_attrs")[number] = sequence
   end
 
-  -- Colours live here, keyed by name, because the cues themselves only expose
-  -- the appearance's name.
-  local appearancePool = newHandle({}, {}, APPEARANCE_POOL)
+  -- Colours live here. Where the collection hangs off the data pool varies,
+  -- so M.appearanceCollection decides which route exposes it.
+  local appearancePool = newHandle({ Name = "Appearances" }, {}, APPEARANCE_POOL)
 
-  local pool = newHandle({}, { sequences = sequencePool, appearances = appearancePool })
-  rawget(pool, "_attrs").Sequences   = sequencePool
-  rawget(pool, "_attrs").Appearances = appearancePool
+  local children = {}
+  local pool = newHandle({}, { sequences = sequencePool }, children)
+  rawget(pool, "_attrs").Sequences = sequencePool
+
+  if M.appearanceCollection == "Appearance" then
+    rawget(pool, "_attrs").Appearance = appearancePool
+  elseif M.appearanceCollection == "children" then
+    -- Reachable only by scanning the data pool's children for one named
+    -- Appearances, the accessor-independent catch-all.
+    children[#children + 1] = appearancePool
+  else
+    rawget(pool, "_attrs").Appearances = appearancePool
+    rawget(pool, "_attrs").appearances = appearancePool
+  end
+
   return pool
 end
 

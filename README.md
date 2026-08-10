@@ -76,6 +76,34 @@ Tap the plugin. Three steps, in order:
 The PDF is written to the root of the chosen drive, and a final dialog shows the
 full path.
 
+### If the colors don't come through
+
+Appearance colors have been the stubborn part of this plugin, so there are two
+answers to that.
+
+**First**, an export that reads no Appearance color at all writes a
+`<name>-appearance-report.txt` next to the PDF and says so in the final dialog.
+That file records every place the plugin looked for the Appearance pool, what
+each Appearance reported for `Name` / `BackR` / `BackG` / `BackB` / `BackColor`
+read three different ways, and what each cue reported for its Appearance. It
+turns "colors don't work" into a specific answer.
+
+**Second**, `CFG.sections` colors the sheet without MA3's help at all. Fill in
+your songs by cue range and the export uses them:
+
+```lua
+sections = {
+  { from = 1,  to = 13, name = "Opening",    color = {  32,  78, 168 } },
+  { from = 14, to = 27, name = "Ballad",     color = { 250, 236, 130 } },
+  { from = 28, to = 49, name = "Big Chorus", color = { 198,  40,  40 } },
+},
+```
+
+Colors are `{ r, g, b }` in 0–255. Any cue inside a range gets that section's
+band and row tint, and these **win** over whatever the show reports. Cues outside
+every range fall back to the show's Appearances, then to plain zebra striping.
+Leave the table empty to rely on the show alone.
+
 MA3's **CueZero** and **OffCue** are filtered out — they are machinery rather
 than cues anyone wants on a printed sheet. Set `hideSpecialCues = false` in
 `CFG` to keep them.
@@ -143,9 +171,16 @@ convenient version, because each of these has already shipped as a bug:
   hardware, as well as the Cue column rendering `1`.
 - A cue's `Name` arrives as that same label, so a test asserts the Name column
   reads `Blackout` rather than repeating `Cue 1 Blackout`.
-- Appearance colour is exercised in **four** exposure modes — plain numbers,
-  display-role strings, percentages, and a combined `BackColor` — via
-  `mock.appearanceMode`, because which one a real build uses is still unknown.
+- Appearance colour is exercised across a **matrix**, because which combination
+  a real build uses is still unknown: four value exposures
+  (`mock.appearanceMode` — plain numbers, display strings, percentages, combined
+  `BackColor`), three ways a cue refers to its Appearance (`mock.appearanceRef`
+  — name, number, `Appearance 3`), and three places the pool hangs
+  (`mock.appearanceCollection`, including reachable only by child scan). All ten
+  must read the same colour.
+- `mock.appearanceRef = "none"` reproduces the console's actual behaviour to
+  date, and asserts the diagnostic report is written, that it is *not* written
+  when colours work, and that `CFG.sections` colours the export on its own.
 - Appearance colors resolve **only** through the pool's `Appearances` collection
   by name — `cue.appearance` is nil, exactly as on hardware — so a passing color
   test proves the fallback path, not the handle path that never worked.
@@ -175,12 +210,20 @@ cell rather than aborting the export. Two specifics worth knowing:
   pulls the first number out and everything — pools, sequences, cues — goes
   through it. By the same mechanism `Appearance` comes back as the appearance's
   *name*, never a handle.
-- Appearance colors come from `BackR` / `BackG` / `BackB`, documented as
-  **0–255**, but neither the property route nor the value scale is consistent
-  between builds. `colorChannel()` reads a plain value, then the display role,
-  and detects a percentage; `combinedColor()` covers builds exposing one
-  `BackColor` instead of three channels. Reading them off a handle hung on the
-  cue does not work on every build either.
+- **Appearance colors are the least reliable thing here.** Nothing about them
+  is consistent: not the property route, not the value scale, not how a cue
+  refers to its Appearance, not where the Appearance pool hangs. The plugin
+  therefore covers a matrix rather than one path — `colorChannel()` reads a
+  plain value then the display role and detects percentages, `combinedColor()`
+  handles a single `BackColor`, `findAppearanceCollection()` tries four
+  accessors then scans the data pool's children, and `buildAppearanceIndex()`
+  keys each Appearance by name, number, `appearance <n>` and position so any
+  form a cue reports resolves. Position is claimed in a second pass so it can
+  never shadow a real pool number — pool order is not the same as numbering.
+- When an export reads no color at all it writes an
+  `-appearance-report.txt` beside the PDF dumping every one of those routes and
+  what MA3 returned, so a failure explains itself instead of costing a round of
+  inference. `CFG.sections` is the guaranteed fallback.
   `buildAppearanceIndex()` therefore indexes the data pool's `Appearances` by
   name once per export, and `readAppearance()` falls back to looking the cue's
   appearance *name* up in it. That fallback is the path that actually works on

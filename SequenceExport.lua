@@ -71,10 +71,21 @@ local CFG = {
   -- -- to lock it in; the field then disappears and the dialog only asks for a
   -- sequence. Editable from the console's plugin editor.
   dataPool = nil,
+
+  -- Sections by hand, for when MA3 will not hand its Appearance colours over.
+  -- Any cue whose number falls in a range gets that section's band and row
+  -- tint, and these win over whatever the plugin reads from the show. Colours
+  -- are 0-255, the same scale MA3 reports. Leave empty to use the show's own
+  -- Appearances. Editable from the console's plugin editor.
+  sections = {
+    -- { from = 1,  to = 13, name = "Opening",    color = {  32,  78, 168 } },
+    -- { from = 14, to = 27, name = "Ballad",     color = { 250, 236, 130 } },
+    -- { from = 28, to = 49, name = "Big Chorus", color = { 198,  40,  40 } },
+  },
 }
 
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.3.2"
+local PLUGIN_VERSION = "1.4.0"
 
 --- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
 --- misbehaves only on a console is otherwise pure guesswork.
@@ -738,30 +749,108 @@ end
 --- a display string. That is why cue numbers arrive as "Cue 1 Blackout" rather
 --- than 1, and by the same token an Appearance arrives as its name. Indexing
 --- the pool by name turns that string back into a colour.
-local function buildAppearanceIndex(dataPoolHandle)
-  local index = {}
+--- Every route to a data pool's Appearances collection, in order of likelihood.
+--- Returns collection, routeName.
+local function findAppearanceCollection(dataPoolHandle)
+  local routes = {}
 
-  local collection
   if dataPoolHandle ~= nil then
-    local ok, pool = pcall(function() return dataPoolHandle.Appearances end)
-    if ok then collection = pool end
+    routes[#routes + 1] = { name = "pool.Appearances",
+      get = function() return dataPoolHandle.Appearances end }
+    routes[#routes + 1] = { name = "pool.Appearance",
+      get = function() return dataPoolHandle.Appearance end }
   end
-  if collection == nil then
-    local ok, pool = pcall(function() return DataPool().Appearances end)
-    if ok then collection = pool end
-  end
-  if collection == nil then return index end
+  routes[#routes + 1] = { name = "DataPool().Appearances",
+    get = function() return DataPool().Appearances end }
+  routes[#routes + 1] = { name = "DataPool().Appearance",
+    get = function() return DataPool().Appearance end }
 
-  for _, handle in ipairs(childrenOf(collection)) do
-    local color = colorFromAppearance(handle)
-    local name  = clean(getProp(handle, "Name"))
-    if color ~= nil and name ~= "" then
-      index[name] = color
-      index[name:lower()] = color
+  for _, route in ipairs(routes) do
+    local ok, collection = pcall(route.get)
+    if ok and collection ~= nil and #childrenOf(collection) > 0 then
+      return collection, route.name
     end
   end
 
+  -- Catch-all that does not depend on the accessor spelling: walk the data
+  -- pool's own children looking for the one called Appearances.
+  for _, handle in ipairs(childrenOf(dataPoolHandle)) do
+    local name = clean(getProp(handle, "Name")):lower()
+    if name == "appearances" or name == "appearance" then
+      return handle, "child scan"
+    end
+  end
+
+  return nil, nil
+end
+
+--- Name -> colour for every Appearance in a data pool.
+local function buildAppearanceIndex(dataPoolHandle)
+  local index = {}
+
+  local collection, route = findAppearanceCollection(dataPoolHandle)
+  if collection == nil then
+    trace("no appearance collection found")
+    return index
+  end
+  trace("appearance collection found via %s", route)
+
+  local entries = {}
+  for position, handle in ipairs(childrenOf(collection)) do
+    local color = colorFromAppearance(handle)
+    if color ~= nil then
+      entries[#entries + 1] = {
+        color    = color,
+        position = position,
+        name     = clean(getProp(handle, "Name")),
+        number   = numberToken(clean(getProp(handle, "No"))),
+      }
+    end
+  end
+
+  local function claim(key, color)
+    if key ~= nil and key ~= "" and index[key] == nil then
+      index[key] = color
+    end
+  end
+
+  -- Name and pool number are authoritative, so they are claimed first. A cue
+  -- may report any of these forms and which one is not knowable from here.
+  for _, entry in ipairs(entries) do
+    claim(entry.name, entry.color)
+    claim(entry.name:lower(), entry.color)
+    if entry.number ~= nil then
+      claim(entry.number, entry.color)
+      claim("appearance " .. entry.number, entry.color)
+    end
+  end
+
+  -- Position is a weak fallback for appearances with no readable number, and
+  -- must never shadow a real one -- pool order is not the same as numbering.
+  for _, entry in ipairs(entries) do
+    claim(tostring(entry.position), entry.color)
+  end
+
   return index
+end
+
+--- Look a cue's reported appearance up under every form it might take.
+local function lookupAppearance(index, reported)
+  if index == nil or reported == nil or reported == "" then return nil end
+
+  local candidates = { reported, reported:lower() }
+
+  local token = numberToken(reported)
+  if token ~= nil then
+    candidates[#candidates + 1] = token
+    candidates[#candidates + 1] = "appearance " .. token
+  end
+
+  for _, key in ipairs(candidates) do
+    if index[key] ~= nil then return index[key] end
+  end
+
+  return nil
 end
 
 --- The colour for a cue, from a handle when that works and from the appearance
@@ -784,16 +873,16 @@ local function readAppearance(cueHandle, appearanceIndex)
     end
   end
 
-  -- Fall back to the display string, which is the appearance's name.
-  local name = clean(getProp(cueHandle, "Appearance"))
-  if name ~= "" and appearanceIndex then
-    local color = appearanceIndex[name] or appearanceIndex[name:lower()]
+  -- Fall back to the display string, which names or references the appearance.
+  local reported = clean(getProp(cueHandle, "Appearance"))
+  if reported ~= "" then
+    local color = lookupAppearance(appearanceIndex, reported)
     if color ~= nil then
-      trace("appearance %q resolved through the pool index", name)
+      trace("appearance %q resolved through the pool index", reported)
       return color
     end
-    trace("appearance %q is not in the pool index", name)
-  elseif name == "" then
+    trace("appearance %q is not in the pool index", reported)
+  else
     trace("cue reports no appearance at all")
   end
 
@@ -842,6 +931,154 @@ local function isSpecialCue(name, number)
   return false
 end
 
+--=============================================================================
+-- APPEARANCE REPORT
+--
+-- Appearance colours have failed to export three times running, and none of it
+-- is reproducible away from a console. Rather than guess a fourth time, an
+-- export that reads no colour at all writes this alongside the PDF: every
+-- route tried and everything MA3 handed back. One export then answers the
+-- question instead of another round of inference.
+--=============================================================================
+
+--- Render a value with its type, without risking a tostring() error.
+local function describeValue(value)
+  local ok, text = pcall(tostring, value)
+  if not ok then return "<untostringable>" end
+  if type(value) == "string" then return string.format("string %q", value) end
+  return string.format("%s %s", type(value), text)
+end
+
+--- Read one property every way there is, for the report.
+local function readEveryWay(handle, property)
+  local parts = {}
+
+  local ok, value = pcall(function() return handle:Get(property) end)
+  parts[#parts + 1] = "Get() = " .. (ok and describeValue(value) or "ERROR")
+
+  local role = displayRole()
+  if role ~= nil then
+    ok, value = pcall(function() return handle:Get(property, role) end)
+    parts[#parts + 1] = "Get(Display) = " .. (ok and describeValue(value) or "ERROR")
+  end
+
+  ok, value = pcall(function() return handle[property:lower()] end)
+  parts[#parts + 1] = "." .. property:lower() .. " = " ..
+    (ok and describeValue(value) or "ERROR")
+
+  return table.concat(parts, "   |   ")
+end
+
+--- Build the diagnostic text for a data pool and a sequence's cues.
+local function buildAppearanceReport(dataPoolHandle, sequenceHandle, index)
+  local lines = {}
+  local function add(fmt, ...)
+    local args = { ... }
+    local ok, text = pcall(string.format, fmt, table.unpack(args))
+    lines[#lines + 1] = ok and text or fmt
+  end
+
+  add("%s %s - appearance diagnostic", PLUGIN_NAME, PLUGIN_VERSION)
+  add("No cue in this sequence reported an Appearance colour, so this file")
+  add("records everything the plugin tried and what grandMA3 returned.")
+  add("")
+
+  add("== where the Appearance pool was looked for ==")
+  local collection, route = findAppearanceCollection(dataPoolHandle)
+  if collection == nil then
+    add("  NOT FOUND by any route -- colours cannot be resolved by name.")
+  else
+    add("  found via %s, holding %d appearance(s)", route, #childrenOf(collection))
+  end
+  add("")
+
+  if collection ~= nil then
+    add("== what each Appearance reports ==")
+    for position, handle in ipairs(childrenOf(collection)) do
+      if position > 8 then
+        add("  ... and %d more", #childrenOf(collection) - 8)
+        break
+      end
+      add("  appearance %d:", position)
+      for _, property in ipairs({ "Name", "No", "BackR", "BackG", "BackB", "BackColor" }) do
+        add("    %-10s %s", property, readEveryWay(handle, property))
+      end
+      local color = colorFromAppearance(handle)
+      add("    -> plugin read: %s", color and
+        string.format("r=%.3f g=%.3f b=%.3f", color.r, color.g, color.b) or "NO COLOUR")
+    end
+    add("")
+  end
+
+  add("== the lookup keys that were built ==")
+  local keys = {}
+  for key in pairs(index or {}) do keys[#keys + 1] = key end
+  table.sort(keys)
+  if #keys == 0 then
+    add("  none -- the index is empty")
+  else
+    add("  %s", table.concat(keys, ", "))
+  end
+  add("")
+
+  add("== what each cue reports for its Appearance ==")
+  local shown = 0
+  for _, cueHandle in ipairs(childrenOf(sequenceHandle)) do
+    local number = cueNumber(cueHandle)
+    local name   = clean(getProp(cueHandle, "Name"))
+
+    -- Skip CueZero and OffCue so the sample is real cues.
+    if not isSpecialCue(name, number) then
+      shown = shown + 1
+      if shown > 8 then break end
+      add("  cue %s (%s):", number, stripCueLabel(name, number))
+      add("    Appearance %s", readEveryWay(cueHandle, "Appearance"))
+    end
+  end
+  add("")
+  add("Send this file back and the colour question is settled.")
+
+  return table.concat(lines, "\n") .. "\n"
+end
+
+--- Write the report next to the PDF. Never lets a failure break the export.
+local function writeAppearanceReport(pdfPath, text)
+  local path = pdfPath:gsub("%.[Pp][Dd][Ff]$", "") .. "-appearance-report.txt"
+  local ok = pcall(function()
+    local file = assert(io.open(path, "wb"))
+    file:write(text)
+    file:close()
+  end)
+  if ok then return path end
+  return nil
+end
+
+--- The hand-configured section covering a cue number, if there is one.
+--- These win over whatever the show reports, so a user who cannot get MA3 to
+--- hand its Appearances over still gets coloured sections.
+local function manualSection(number)
+  local value = tonumber(number)
+  if value == nil then return nil end
+
+  for _, section in ipairs(CFG.sections or {}) do
+    local from = tonumber(section.from) or -math.huge
+    local to   = tonumber(section.to) or math.huge
+    if value >= from and value <= to then
+      local color = section.color or { 128, 128, 128 }
+      local name  = section.name or ""
+      return {
+        r    = (tonumber(color[1]) or 0) / 255,
+        g    = (tonumber(color[2]) or 0) / 255,
+        b    = (tonumber(color[3]) or 0) / 255,
+        name = name,
+        key  = "manual:" .. (name ~= "" and name or tostring(from)),
+      }
+    end
+  end
+
+  return nil
+end
+
 --- Every cue of a sequence, in sheet order.
 local function collectCues(sequenceHandle, appearanceIndex)
   local cues = {}
@@ -864,13 +1101,18 @@ local function collectCues(sequenceHandle, appearanceIndex)
     if CFG.hideSpecialCues and isSpecialCue(name, number) then
       trace("skipping special cue %q (no %q)", name, number)
     else
+      local fromShow = readAppearance(cueHandle, appearanceIndex)
+
       cues[#cues + 1] = {
-        no         = number,
-        name       = name,
-        note       = clean(getProp(cueHandle, "Note")),
-        fade       = clean(getProp(part, "CueFade")),
-        delay      = clean(getProp(part, "CueDelay")),
-        appearance = readAppearance(cueHandle, appearanceIndex),
+        no             = number,
+        name           = name,
+        note           = clean(getProp(cueHandle, "Note")),
+        fade           = clean(getProp(part, "CueFade")),
+        delay          = clean(getProp(part, "CueDelay")),
+        appearance     = manualSection(number) or fromShow,
+        -- Tracked separately so the export can tell whether the show gave up
+        -- anything at all, and write a diagnostic report when it did not.
+        fromShow       = fromShow ~= nil,
       }
     end
   end
@@ -1421,7 +1663,7 @@ local function Main(displayHandle, argument)
   end
 
   local step = "target"
-  local pool, sequence, cues
+  local pool, sequence, cues, appearances
   local lastPool, lastSequence
 
   while true do
@@ -1441,7 +1683,7 @@ local function Main(displayHandle, argument)
         pool, sequence = chosenPool, chosenSequence
         trace("reading sequence %s from data pool %s", sequence.no, pool.no)
 
-        local appearances = buildAppearanceIndex(pool.handle)
+        appearances = buildAppearanceIndex(pool.handle)
         trace("appearance index built")
 
         cues = collectCues(sequence.handle, appearances)
@@ -1490,12 +1732,35 @@ local function Main(displayHandle, argument)
 
           if written then
             say(string.format("Exported %d cues to %s", #cues, path))
+
+            -- If the show handed over no colour at all, say why in a file
+            -- next to the PDF rather than leaving it a mystery.
+            local anyFromShow = false
+            for _, cue in ipairs(cues) do
+              if cue.fromShow then anyFromShow = true break end
+            end
+
+            local reportPath
+            if not anyFromShow then
+              reportPath = writeAppearanceReport(path,
+                buildAppearanceReport(pool.handle, sequence.handle, appearances))
+              if reportPath then
+                complain("No Appearance colours were readable; wrote " .. reportPath)
+              end
+            end
+
+            local message = string.format("Exported %d %s to:\n\n%s",
+              #cues, #cues == 1 and "cue" or "cues", path)
+            if reportPath then
+              message = message ..
+                "\n\nNo Appearance colours could be read from the show." ..
+                "\nA diagnostic was written next to it:\n\n" .. reportPath
+            end
+
             pcall(function()
               MessageBox({
-                title   = PLUGIN_NAME .. " - Done",
-                message = string.format(
-                  "Exported %d %s to:\n\n%s",
-                  #cues, #cues == 1 and "cue" or "cues", path),
+                title    = PLUGIN_NAME .. " - Done",
+                message  = message,
                 display  = display,
                 commands = { { value = 1, name = "Ok" } },
               })
@@ -1528,6 +1793,10 @@ if _G.SEQUENCE_EXPORT_TESTING then
     numberToken      = numberToken,
     stripCueLabel    = stripCueLabel,
     colorFromAppearance = colorFromAppearance,
+    lookupAppearance = lookupAppearance,
+    findAppearanceCollection = findAppearanceCollection,
+    manualSection    = manualSection,
+    buildAppearanceReport = buildAppearanceReport,
     findDataPool     = findDataPool,
     describePools    = describePools,
     isSpecialCue     = isSpecialCue,
