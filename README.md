@@ -14,11 +14,16 @@ the PDF bytes are generated in pure Lua, because MA3 ships no PDF library.
 - Sequence name in **bold** at the top left, with a meta line underneath
   (sequence number, cue count, showfile, timestamp).
 - A heavy separator bar, then the cue table.
-- A **colored section band** every time the Appearance changes, labelled with the
-  Appearance name. Band text flips between black and white automatically so a
-  near-black or pale-yellow Appearance stays readable.
-- Cue rows **tinted** with a light wash of their section color. Cues with no
-  Appearance fall back to plain zebra striping.
+- **The cue that carries an Appearance becomes the section header.** Its own row
+  — number, name, fade, delay and note — is drawn bold on the full Appearance
+  color, so the song title heads the block and the cue appears only once. Text
+  flips between black and white automatically so a near-black or pale-yellow
+  Appearance stays readable.
+- A new section starts at every Appearance-carrying cue, so two songs back to
+  back on the **same** color are still two sections.
+- **Sub-cues** — `58.001`, `58.002` under cue `58` — are tinted with their
+  song's color. Cues that are not sub-cues of the section head end the block and
+  fall back to plain zebra striping, so a color never bleeds past its song.
 - Long notes **word-wrap** and the row grows to fit. Page breaks repeat the
   column headers and re-draw the current section band marked `(cont.)`.
 

@@ -272,6 +272,24 @@ local function buildLongSequence()
       i == 1 and "No appearance assigned to these cues" or "", nil)
   end
 
+  -- Shaped like the real show: a song-header cue carries the Appearance and
+  -- holds the song title, its sub-cues carry none. The two songs deliberately
+  -- share one Appearance -- they must still come out as two sections, which
+  -- only works because the sub-cues between them break the run.
+  add("58", "It Really Is Amazing Grace", "3", "0", "Band starts", APPEARANCES.ballad)
+  add("58.001", "Words ON",     "0", "0", "", nil)
+  add("58.002", "Intro ALL IN", "2", "0", "", nil)
+  add("58.003", "Verse 1/2",    "2", "0", "", nil)
+
+  add("59", "Great Are You Lord", "3", "0", "Same appearance as the song above",
+    APPEARANCES.ballad)
+  add("59.001", "Verse 1", "0", "0", "", nil)
+  add("59.002", "Chorus",  "2", "0", "", nil)
+
+  -- A section-opening cue with no name, which must fall back to "Cue 59.5".
+  add("59.5", "", "1", "0", "Unnamed section head", APPEARANCES.chorus)
+  add("59.501", "After the unnamed head", "0", "0", "", nil)
+
   -- A note far longer than one page, to prove the row gets clipped rather
   -- than running off the bottom edge.
   add("57", "Runaway Note", "3", "0",

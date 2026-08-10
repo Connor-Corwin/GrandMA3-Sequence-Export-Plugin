@@ -365,6 +365,32 @@ check("an apostrophe inside a name survives",
 mock.install()
 mock.setUsbPath(OUT_DIR)
 
+print("\n== section headers are the cue that carries the appearance ==")
+
+mock.install()
+mock.setUsbPath(OUT_DIR)
+
+local songPools = internals.listDataPools()
+local songCues = internals.collectCues(
+  internals.listSequences(songPools[2].handle)[1].handle,
+  internals.buildAppearanceIndex(songPools[2].handle))
+
+local byNumber = {}
+for _, cue in ipairs(songCues) do byNumber[cue.no] = cue end
+
+check("the song header cue carries an appearance",
+  byNumber["58"] ~= nil and byNumber["58"].appearance ~= nil)
+check("its sub-cues carry none",
+  byNumber["58.001"] ~= nil and byNumber["58.001"].appearance == nil)
+check("the next song shares that appearance",
+  byNumber["59"] ~= nil and byNumber["59"].appearance ~= nil
+    and byNumber["59"].appearance.key == byNumber["58"].appearance.key,
+  byNumber["59"] and byNumber["59"].appearance and byNumber["59"].appearance.key)
+
+check("a section head with no name falls back to its cue number",
+  byNumber["59.5"] ~= nil and byNumber["59.5"].name == "",
+  byNumber["59.5"] and byNumber["59.5"].name)
+
 print("\n== manual sections ==")
 
 check("a cue outside every range gets nothing",

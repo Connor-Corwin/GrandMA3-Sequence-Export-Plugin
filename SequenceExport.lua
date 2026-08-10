@@ -85,7 +85,7 @@ local CFG = {
 }
 
 local PLUGIN_NAME    = "Sequence Export"
-local PLUGIN_VERSION = "1.4.1"
+local PLUGIN_VERSION = "1.5.0"
 
 --- Step-by-step logging, off unless CFG.debug is set. Diagnosing a plugin that
 --- misbehaves only on a console is otherwise pure guesswork.
@@ -1234,8 +1234,9 @@ local function manualSection(number)
         r    = (tonumber(color[1]) or 0) / 255,
         g    = (tonumber(color[2]) or 0) / 255,
         b    = (tonumber(color[3]) or 0) / 255,
-        name = name,
-        key  = "manual:" .. (name ~= "" and name or tostring(from)),
+        name   = name,
+        manual = true,
+        key    = "manual:" .. (name ~= "" and name or tostring(from)),
       }
     end
   end
@@ -1380,20 +1381,29 @@ local function renderDocument(sequenceName, sequenceNumber, cues, showfile)
     y = y + 2
   end
 
-  local function drawSectionBand(appearance, continued)
-    local label = appearance.name ~= "" and appearance.name or "(unnamed appearance)"
+  --- A label-only bar. Used for hand-configured sections, which carry a name
+  --- of their own, and to reprise a section heading after a page break.
+  local function drawSectionBand(appearance, label, continued)
     if continued then label = label .. "  (cont.)" end
 
     y = y + CFG.bandGapAbove
-    pdf:rect(page, left, y, contentWidth, CFG.bandHeight, { appearance.r, appearance.g, appearance.b })
+    pdf:rect(page, left, y, contentWidth, CFG.bandHeight,
+      { appearance.r, appearance.g, appearance.b })
     pdf:text(page, left + CFG.cellPad + 2, y + CFG.bandHeight - 5,
       PDF.truncate(label, true, CFG.bandSize, contentWidth - CFG.cellPad * 2 - 4),
       true, CFG.bandSize, contrastingInk(appearance))
     y = y + CFG.bandHeight
   end
 
+  --- What a section started by this cue is called: the cue's own name, since
+  --- that is where the song title lives, falling back to its number.
+  local function sectionLabelFor(cue)
+    if cue.name ~= "" then return cue.name end
+    if cue.no ~= "" then return "Cue " .. cue.no end
+    return "(unnamed)"
+  end
+
   local pageCount = 0
-  local currentSection = nil
 
   -- A cue row is never split across pages, so a note longer than one whole
   -- page has to be clipped or it would run off the bottom. Derive the cap from
@@ -1447,8 +1457,45 @@ local function renderDocument(sequenceName, sequenceNumber, cues, showfile)
 
   local zebraIndex = 0
 
+  -- The colour block a cue belongs to, carried forward so a song's sub-cues --
+  -- which hold no Appearance of their own -- sit inside their song's tint.
+  local sectionColor, sectionLabel = nil, nil
+  local sectionHead = nil     -- whole-number part of the section head's cue
+  local previousKey = nil
+
+  --- Is this cue a sub-cue of the cue that opened the section? 58.001 belongs
+  --- to 58; 51 does not belong to 28. Without this the tint would bleed on
+  --- past a song into whatever follows it.
+  local function belongsToSection(cue)
+    if sectionHead == nil then return false end
+    local value = tonumber(cue.no)
+    if value == nil then return false end
+    return math.floor(value) == sectionHead
+  end
+
   for _, cue in ipairs(cues) do
     local sectionKey = cue.appearance and cue.appearance.key or nil
+
+    -- A cue opens a section when it carries an Appearance the cue before it did
+    -- not. Sub-cues carry none, so two consecutive songs sharing a colour still
+    -- split; a run of cues all carrying the same Appearance collapses to one.
+    local startsSection = cue.appearance ~= nil and sectionKey ~= previousKey
+
+    -- Hand-configured sections are named by the user, not by any cue, so they
+    -- keep a label bar of their own rather than becoming the cue's row.
+    local isHeaderRow = startsSection and not cue.appearance.manual
+    local needsBand   = startsSection and cue.appearance.manual
+
+    if startsSection then
+      sectionColor = cue.appearance
+      sectionLabel = cue.appearance.manual and cue.appearance.name or sectionLabelFor(cue)
+      sectionHead  = math.floor(tonumber(cue.no) or 0)
+    elseif cue.appearance ~= nil then
+      -- Still inside a run of cues carrying the same Appearance.
+      sectionColor = cue.appearance
+    elseif not belongsToSection(cue) then
+      sectionColor, sectionLabel, sectionHead = nil, nil, nil
+    end
 
     -- Measure the row before committing it, so a row never straddles a page.
     local values = {
@@ -1463,63 +1510,66 @@ local function renderDocument(sequenceName, sequenceNumber, cues, showfile)
     for i, column in ipairs(COLUMNS) do
       local available = column.width - CFG.cellPad * 2
       if column.wrap then
-        local lines = PDF.wrapText(values[column.key], false, CFG.bodySize, available)
+        local lines = PDF.wrapText(values[column.key], isHeaderRow, CFG.bodySize, available)
         if #lines == 0 then lines = { "" } end
         if #lines > maxNoteLines then
           local clipped = {}
           for index = 1, maxNoteLines do clipped[index] = lines[index] end
-          clipped[maxNoteLines] =
-            PDF.truncate(clipped[maxNoteLines] .. " ...", false, CFG.bodySize, available)
+          clipped[maxNoteLines] = PDF.truncate(
+            clipped[maxNoteLines] .. " ...", isHeaderRow, CFG.bodySize, available)
           lines = clipped
         end
         cells[i] = lines
         if #lines > lineCount then lineCount = #lines end
       else
-        cells[i] = { PDF.truncate(values[column.key], false, CFG.bodySize, available) }
+        cells[i] = {
+          PDF.truncate(values[column.key], isHeaderRow, CFG.bodySize, available),
+        }
       end
     end
 
     local rowHeight = lineCount * CFG.lineGap + CFG.rowPadding
-    local needsBand = sectionKey ~= currentSection and cue.appearance ~= nil
     local needed = rowHeight + (needsBand and (CFG.bandHeight + CFG.bandGapAbove) or 0)
 
     if y + needed > bottomLimit then
       startPage(false)
-      -- Carry the section context onto the new page.
-      if cue.appearance ~= nil then
-        drawSectionBand(cue.appearance, sectionKey == currentSection)
-        currentSection = sectionKey
-        needsBand = false
-      else
-        currentSection = nil
+      -- Reprise the heading so a song continuing overleaf still has one, but
+      -- without repeating the header cue's data.
+      if sectionColor ~= nil and not startsSection then
+        drawSectionBand(sectionColor, sectionLabel, true)
       end
       zebraIndex = 0
     end
 
     if needsBand then
-      drawSectionBand(cue.appearance, false)
-      currentSection = sectionKey
+      drawSectionBand(cue.appearance, sectionLabel, false)
       zebraIndex = 0
-    elseif cue.appearance == nil then
-      currentSection = nil
     end
 
-    -- Row background: appearance tint, or zebra striping when uncolored.
-    if cue.appearance ~= nil then
-      pdf:rect(page, left, y, contentWidth, rowHeight, tint(cue.appearance, CFG.tintStrength))
+    -- Background: the full Appearance colour for a section header, its tint for
+    -- the cues inside that section, zebra striping outside any section.
+    if isHeaderRow then
+      pdf:rect(page, left, y, contentWidth, rowHeight,
+        { sectionColor.r, sectionColor.g, sectionColor.b })
+      zebraIndex = 0
+    elseif sectionColor ~= nil then
+      pdf:rect(page, left, y, contentWidth, rowHeight, tint(sectionColor, CFG.tintStrength))
     elseif zebraIndex % 2 == 1 then
       pdf:rect(page, left, y, contentWidth, rowHeight, CFG.zebra)
     end
+
+    local ink = isHeaderRow and contrastingInk(sectionColor) or CFG.ink
 
     for i, lines in ipairs(cells) do
       for lineIndex, lineText in ipairs(lines) do
         pdf:text(page,
           columnX[i] + CFG.cellPad,
           y + CFG.rowPadding * 0.5 + lineIndex * CFG.lineGap - 2,
-          lineText, false, CFG.bodySize, CFG.ink)
+          lineText, isHeaderRow, CFG.bodySize, ink)
       end
     end
 
+    previousKey = sectionKey
     y = y + rowHeight
     pdf:line(page, left, y, right, y, CFG.rule, CFG.ruleWeight)
     zebraIndex = zebraIndex + 1

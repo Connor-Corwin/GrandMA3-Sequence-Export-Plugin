@@ -18,10 +18,10 @@ EXPECTED_TEXT = [
     "Act One (Main)",        # sequence name, the bold title
     "Sequence 12",           # meta line
     "Cue", "Name", "Fade", "Delay", "Note",   # column headers
-    "01 Opening",            # appearance section bands
-    "02 Ballad",
-    "03 Big Chorus",
-    "04 Encore",
+    # Sections are now titled by the cue that carries the Appearance, so the
+    # Appearance's own name ("01 Opening") is deliberately absent.
+    "It Really Is Amazing Grace",
+    "Great Are You Lord",
     "House to Half",         # first cue
     "Final Blackout",        # last cue
     "Preset check before doors",
@@ -152,6 +152,47 @@ def main(path: str) -> int:
     # The data pool was dropped from the header line.
     check("the header no longer names the data pool",
           "data pool" not in doc[0].get_text().lower())
+
+    for appearance_name in ("01 Opening", "02 Ballad", "03 Big Chorus"):
+        check(f"the Appearance name {appearance_name!r} is not used as a label",
+              appearance_name.lower() not in lowered)
+
+    # The section header IS the cue's row, so a song title appears once, not
+    # once in a band and again in the row beneath it.
+    for song in ("It Really Is Amazing Grace", "Great Are You Lord"):
+        check(f"{song!r} appears exactly once", text.count(song) == 1,
+              f"{text.count(song)} occurrences")
+
+    # Those two songs share one Appearance and are separated only by sub-cues
+    # carrying none, so they must still be two sections: each song title must be
+    # drawn on a full-strength fill, not a pale tint.
+    def fill_under(needle: str):
+        for page in doc:
+            hits = page.search_for(needle)
+            if not hits:
+                continue
+            box = hits[0]
+            best = None
+            for drawing in page.get_drawings():
+                fill = drawing.get("fill")
+                if not fill or drawing["type"] not in ("f", "fs"):
+                    continue
+                if drawing["rect"].y0 - 2 <= box.y0 and drawing["rect"].y1 + 2 >= box.y1:
+                    best = fill
+            return best
+        return None
+
+    for song in ("It Really Is Amazing Grace", "Great Are You Lord"):
+        fill = fill_under(song)
+        saturated = fill is not None and max(fill[:3]) - min(fill[:3]) > 0.2
+        check(f"{song!r} sits on a full-strength section fill", saturated,
+              str(fill))
+
+    # A sub-cue under a song must be tinted, not left on white.
+    sub_fill = fill_under("Intro ALL IN")
+    check("a sub-cue inherits its song's tint",
+          sub_fill is not None and max(sub_fill[:3]) - min(sub_fill[:3]) > 0.01,
+          str(sub_fill))
 
     print()
     if failures:
